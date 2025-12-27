@@ -161,7 +161,8 @@ class SDARDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)

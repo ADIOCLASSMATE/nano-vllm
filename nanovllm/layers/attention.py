@@ -122,8 +122,9 @@ class BlockAttention(Attention):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         
-        # Store k, v to cache during prefill
-        if context.is_prefill and k_cache.numel() and v_cache.numel():
+        # Store k, v to cache (both prefill and decode phases)
+        # In prefill, stores all tokens. In decode, stores just the current token(s)
+        if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         
         # Prefill phase: use sparse attention with block pattern
@@ -150,18 +151,14 @@ class BlockAttention(Attention):
             if hasattr(context, 'block_length') and context.block_length is not None:
                 # Reshape to block structure for local attention
                 block_len = context.block_length
-                seq_len = q.shape[0]
-                num_blocks = (seq_len + block_len - 1) // block_len
+                # Reshape q, k, v to block format: (seq_len, num_heads, head_dim) -> (num_blocks, block_len, num_heads, head_dim)
+                q = q.view(-1, block_len, self.num_heads, self.head_dim)
+                k = k.view(-1, block_len, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, block_len, self.num_kv_heads, self.head_dim)
                 
-                # Pad if necessary
-                padded_len = num_blocks * block_len
-                if seq_len < padded_len:
-                    pad_len = padded_len - seq_len
-                    q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len))
-                
-                q = q.view(num_blocks, block_len, self.num_heads, self.head_dim)
                 # Use flash attention with cache and block-local masking
-                o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache,
+                # Note: must pass k and v for the current block, not just k_cache and v_cache
+                o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
                                             cache_seqlens=context.context_lens,
                                             block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=False)
