@@ -216,6 +216,142 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
+        """Update model parameters by broadcasting full weights via NCCL.
+        
+        Rank 0 sends full (unsharded) weights to all ranks via NCCL broadcast.
+        Each rank then applies its own weight_loader to handle tensor parallel sharding.
+        
+        Args:
+            param_dict: A dictionary mapping parameter names to new tensor values.
+                       These should be FULL (unsharded) weights from the source model.
+        """
+        if self.world_size == 1:
+            # Single GPU: use weight_loader directly
+            self._apply_weights_with_loader(param_dict)
+            return
+        
+        # Multi-GPU: store param_dict for rank 0 to use during broadcast
+        self._pending_param_dict = param_dict
+        
+        # Signal other ranks to start receiving (send param info via shared memory)
+        param_names = list(param_dict.keys())
+        shapes = [list(t.shape) for t in param_dict.values()]
+        dtypes = [str(t.dtype) for t in param_dict.values()]
+        
+        # call() will trigger _receive_and_apply_weights on all ranks including rank 0
+        self.call("_receive_and_apply_weights", param_names, shapes, dtypes)
+
+    def _receive_and_apply_weights(self, param_names: list[str], shapes: list[list[int]], dtypes: list[str]):
+        """Receive weights via NCCL broadcast and apply with weight_loader.
+        
+        Called on all ranks. Rank 0 broadcasts, other ranks receive.
+        """
+        # Get param_dict from pending storage (only rank 0 has it)
+        param_dict = getattr(self, '_pending_param_dict', None)
+        
+        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
+        
+        for i, weight_name in enumerate(param_names):
+            shape = torch.Size(shapes[i])
+            dtype = getattr(torch, dtypes[i].replace('torch.', ''))
+            
+            # Create buffer for receiving
+            if self.rank == 0 and param_dict is not None:
+                # Rank 0: use the actual tensor
+                full_weight = param_dict[weight_name].to(device='cuda', dtype=dtype)
+            else:
+                # Other ranks: create empty buffer to receive
+                full_weight = torch.empty(shape, dtype=dtype, device='cuda')
+            
+            # Broadcast from rank 0
+            dist.broadcast(full_weight, src=0)
+            
+            # Now apply with weight_loader (each rank shards differently based on tp_rank)
+            self._apply_single_weight(weight_name, full_weight, packed_modules_mapping)
+            
+            # Free memory
+            del full_weight
+        
+        dist.barrier()
+        
+        # Clear pending param_dict
+        if hasattr(self, '_pending_param_dict'):
+            del self._pending_param_dict
+
+    def _apply_weights_with_loader(self, param_dict: dict[str, torch.Tensor]):
+        """Apply weights using weight_loader (single GPU path)."""
+        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
+        for weight_name, tensor in param_dict.items():
+            self._apply_single_weight(weight_name, tensor, packed_modules_mapping)
+
+    def _apply_single_weight(self, weight_name: str, tensor: torch.Tensor, packed_modules_mapping: dict):
+        """Apply a single weight using the appropriate weight_loader."""
+        # Check if this weight is part of a packed module (e.g., q_proj -> qkv_proj)
+        for k, (v, shard_id) in packed_modules_mapping.items():
+            if k in weight_name:
+                param_name = weight_name.replace(k, v)
+                try:
+                    param = self.model.get_parameter(param_name)
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is not None:
+                        with torch.no_grad():
+                            weight_loader(param, tensor, shard_id)
+                except AttributeError:
+                    pass
+                break
+        else:
+            # Not a packed module, load directly with weight_loader
+            try:
+                param = self.model.get_parameter(weight_name)
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is not None:
+                    with torch.no_grad():
+                        weight_loader(param, tensor)
+                else:
+                    # Fallback: direct copy (for non-sharded params like layernorm)
+                    with torch.no_grad():
+                        param.data.copy_(tensor.to(param.device, param.dtype))
+            except AttributeError:
+                pass
+
+    def sync_model_param(self, param_names: list[str]):
+        """Sync model parameters across all ranks using NCCL broadcast.
+        
+        DEPRECATED: Use update_model_param_with_broadcast instead.
+        This method is kept for backwards compatibility but won't work correctly
+        for tensor parallel models where each rank needs different shards.
+        """
+        if self.world_size == 1:
+            return
+        
+        model_state = self.model.state_dict()
+        for name in param_names:
+            if name in model_state:
+                param = self._get_param_by_name(name)
+                if param is not None:
+                    dist.broadcast(param.data, src=0)
+        
+        dist.barrier()
+    
+    def _get_param_by_name(self, name: str) -> torch.nn.Parameter | None:
+        """Get a parameter by its state_dict key name."""
+        parts = name.split('.')
+        module = self.model
+        for part in parts[:-1]:
+            if hasattr(module, part):
+                module = getattr(module, part)
+            elif part.isdigit():
+                module = module[int(part)]
+            else:
+                return None
+        param_name = parts[-1]
+        if hasattr(module, param_name):
+            attr = getattr(module, param_name)
+            if isinstance(attr, torch.nn.Parameter):
+                return attr
+        return None
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config

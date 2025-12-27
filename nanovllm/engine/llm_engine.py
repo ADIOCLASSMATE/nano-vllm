@@ -1,9 +1,13 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
+from typing import TYPE_CHECKING
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+
+if TYPE_CHECKING:
+    import torch
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -34,8 +38,11 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, 'model_runner') or self.model_runner is None:
+            return  # Already exited
         self.model_runner.call("exit")
         del self.model_runner
+        self.model_runner = None
         for p in self.ps:
             p.join()
 
@@ -55,6 +62,21 @@ class LLMEngine:
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def update_model_param(self, param_dict: dict[str, "torch.Tensor"]):
+        """Update model parameters and sync across all model runners using NCCL broadcast.
+        
+        Args:
+            param_dict: A dictionary mapping parameter names to new tensor values.
+                       Parameter names should match the source model's state_dict keys.
+                       These should be FULL (unsharded) weights.
+        
+        Note:
+            This method broadcasts full weights via NCCL (not shared memory).
+            Each rank then applies its own weight_loader to handle tensor parallel sharding.
+        """
+        # For each parameter, broadcast full weight via NCCL then each rank shards locally
+        self.model_runner.update_model_param_with_broadcast(param_dict)
 
     def generate(
         self,
