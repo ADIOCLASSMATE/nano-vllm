@@ -82,7 +82,12 @@ class Attention(nn.Module):
         return o
 
 class BlockAttention(Attention):
-    """Block-aware attention for SDAR models using sparse attention patterns."""
+    """Block-aware attention for SDAR models using sparse attention patterns.
+    
+    This attention mechanism implements the block-based sparse attention pattern
+    used by SDAR models, with sparse attention during prefill and local attention
+    during decode phases.
+    """
     
     def __init__(
         self,
@@ -94,33 +99,67 @@ class BlockAttention(Attention):
         super().__init__(num_heads, head_dim, scale, num_kv_heads)
     
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        if not JETENGINE_AVAILABLE:
-            # Fallback to standard attention if jetengine is not available
-            return super().forward(q, k, v)
+        """Forward pass for block-aware attention.
         
-        o: torch.Tensor
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        Expected input shapes (already viewed):
+            q: (seq_len, num_heads, head_dim)
+            k: (seq_len, num_kv_heads, head_dim)
+            v: (seq_len, num_kv_heads, head_dim)
+        """
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-
-        should_store_whole = (context.run_type == RunType.PREFILL)
-        if should_store_whole and k_cache.numel() and v_cache.numel():
+        
+        # Store k, v to cache during prefill
+        if context.is_prefill and k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-            
-        if context.run_type == RunType.PREFILL:
-            o = sparse_attn_varlen(q, k, v,
-                                cu_seqlens_q=context.cu_seqlens_q,
-                                cu_seqlens_k=context.cu_seqlens_k,
-                                staircase_size=context.block_length)
+        
+        # Prefill phase: use sparse attention with block pattern
+        if context.is_prefill:
+            if JETENGINE_AVAILABLE:
+                # Use sparse attention with staircase block pattern
+                o = sparse_attn_varlen(q, k, v,
+                                    cu_seqlens_q=context.cu_seqlens_q,
+                                    cu_seqlens_k=context.cu_seqlens_k,
+                                    staircase_size=context.block_length)
+            else:
+                # Fallback: use standard full attention
+                if context.block_tables is not None:
+                    k, v = k_cache, v_cache
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q,
+                                           cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k,
+                                           cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True,
+                                           block_table=context.block_tables)
+        # Decode phase: use block-local attention with cached keys/values
         else:
-            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
-            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
-            o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
-                                        cache_seqlens=context.context_lens,
-                                        block_table=context.block_tables,
-                                        causal=False)  # Assuming non-causal for benchmark consistency     
-        o = o.view(-1, self.num_heads * self.head_dim)
+            if hasattr(context, 'block_length') and context.block_length is not None:
+                # Reshape to block structure for local attention
+                block_len = context.block_length
+                seq_len = q.shape[0]
+                num_blocks = (seq_len + block_len - 1) // block_len
+                
+                # Pad if necessary
+                padded_len = num_blocks * block_len
+                if seq_len < padded_len:
+                    pad_len = padded_len - seq_len
+                    q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len))
+                    # k, v are cached, not padded
+                
+                q = q.view(num_blocks, block_len, self.num_heads, self.head_dim)
+                # Use flash attention with cache and optional block-local masking
+                o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache,
+                                            cache_seqlens=context.context_lens,
+                                            block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=False)
+                # Reshape back to sequence format
+                o = o.reshape(-1, self.num_heads * self.head_dim)
+            else:
+                # Standard decode attention
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens,
+                                            block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
+        
         return o

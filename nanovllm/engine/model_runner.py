@@ -43,7 +43,7 @@ class ModelRunner:
         # Select model based on config
         model_type = hf_config.model_type.lower() if hasattr(hf_config, 'model_type') else 'qwen'
         if 'sdar' in model_type:
-            self.model = SDARForCausalLM(hf_config, dist.get_process_group())
+            self.model = SDARForCausalLM(hf_config)
         else:
             self.model = Qwen3ForCausalLM(hf_config)
         

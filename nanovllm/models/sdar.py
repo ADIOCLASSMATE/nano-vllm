@@ -23,10 +23,9 @@ class SDARAttention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
-        process_group: dist.ProcessGroup = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size(group=process_group)
+        tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -36,12 +35,12 @@ class SDARAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
+        self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
-            process_group,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
@@ -49,7 +48,6 @@ class SDARAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            process_group,
             bias=False,
         )
         self.rotary_emb = get_rope(
@@ -65,8 +63,9 @@ class SDARAttention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        if not self.qkv_bias:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -75,14 +74,16 @@ class SDARAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q_by_head = q.view(-1, self.num_heads, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        if not self.qkv_bias:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
+        # BlockAttention expects: q, k, v with shapes (seq_len, num_heads, head_dim)
         o = self.attn(q, k, v)
+        # o shape: (seq_len, num_heads*head_dim) after BlockAttention processing
         output = self.o_proj(o)
         return output
 
@@ -94,19 +95,16 @@ class SDARMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        process_group: dist.ProcessGroup
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
-            process_group,
             bias=False,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
-            process_group,
             bias=False,
         )
         assert hidden_act == "silu"
@@ -124,7 +122,6 @@ class SDARDecoderLayer(nn.Module):
     def __init__(
         self,
         config,
-        process_group
     ) -> None:
         super().__init__()
         self.self_attn = SDARAttention(
@@ -133,17 +130,15 @@ class SDARDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', False),
+            qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
-            process_group=process_group
         )
         self.mlp = SDARMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            process_group=process_group
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -155,8 +150,7 @@ class SDARDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
@@ -170,13 +164,10 @@ class SDARModel(nn.Module):
     def __init__(
         self,
         config,
-        process_group
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, process_group)
-        self.layers = nn.ModuleList([SDARDecoderLayer(
-            config, process_group) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([SDARDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -204,12 +195,10 @@ class SDARForCausalLM(nn.Module):
     def __init__(
         self,
         config,
-        process_group
     ) -> None:
         super().__init__()
-        self.model = SDARModel(config, process_group)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, process_group)
+        self.model = SDARModel(config)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
@@ -218,12 +207,10 @@ class SDARForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
-        return hidden_states
+        return self.model(input_ids, positions)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
-        return logits
+        return self.lm_head(hidden_states)
