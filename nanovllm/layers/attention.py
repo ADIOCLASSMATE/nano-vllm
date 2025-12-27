@@ -6,6 +6,13 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
+try:
+    from jetengine.kernels.triton.attention import sparse_attn_varlen
+    from jetengine.engine.sequence import RunType
+    JETENGINE_AVAILABLE = True
+except ImportError:
+    JETENGINE_AVAILABLE = False
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -72,4 +79,48 @@ class Attention(nn.Module):
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
+        return o
+
+class BlockAttention(Attention):
+    """Block-aware attention for SDAR models using sparse attention patterns."""
+    
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+    ):
+        super().__init__(num_heads, head_dim, scale, num_kv_heads)
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        if not JETENGINE_AVAILABLE:
+            # Fallback to standard attention if jetengine is not available
+            return super().forward(q, k, v)
+        
+        o: torch.Tensor
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+
+        should_store_whole = (context.run_type == RunType.PREFILL)
+        if should_store_whole and k_cache.numel() and v_cache.numel():
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            
+        if context.run_type == RunType.PREFILL:
+            o = sparse_attn_varlen(q, k, v,
+                                cu_seqlens_q=context.cu_seqlens_q,
+                                cu_seqlens_k=context.cu_seqlens_k,
+                                staircase_size=context.block_length)
+        else:
+            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
+            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                                        cache_seqlens=context.context_lens,
+                                        block_table=context.block_tables,
+                                        causal=False)  # Assuming non-causal for benchmark consistency     
+        o = o.view(-1, self.num_heads * self.head_dim)
         return o

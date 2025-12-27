@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.sdar import SDARForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,9 +29,24 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(self.device_id)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        
+        # Get dtype from hf_config, with fallback options
+        dtype = getattr(hf_config, 'dtype', None) or \
+                getattr(hf_config, 'torch_dtype', None) or \
+                torch.float16
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.replace("torch.", ""))
+        
+        torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        
+        # Select model based on config
+        model_type = hf_config.model_type.lower() if hasattr(hf_config, 'model_type') else 'qwen'
+        if 'sdar' in model_type:
+            self.model = SDARForCausalLM(hf_config, dist.get_process_group())
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
+        
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
