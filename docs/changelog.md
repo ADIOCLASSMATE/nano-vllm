@@ -19,6 +19,7 @@ LLMEngine.update_model_param(param_dict)
 解决问题：
 1. 共享内存只有 1MB，无法传输模型权重
 2. nanovllm 模型已按 tensor parallel 分片，但传入的是完整权重
+3. 使用 gpu_offset=1 让 nanovllm 使用 GPU 1, 2; transformers 模型加载到 cuda:0
 
 
 ## [0.0.1] 2025.12.21

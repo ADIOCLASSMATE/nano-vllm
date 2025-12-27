@@ -11,6 +11,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    gpu_offset: int = 0  # Starting GPU index (e.g., 1 to use GPU 1, 2, ...)
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
