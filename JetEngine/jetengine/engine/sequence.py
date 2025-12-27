@@ -1,0 +1,237 @@
+from copy import copy
+from enum import Enum, auto
+from itertools import count
+from jetengine.sampling_params import SamplingParams
+
+
+class SequenceStatus(Enum):
+    WAITING = auto()      # Has a prompt part to prefill
+    PREFILLING = auto()   # Is currently in a prefill model run
+    DENOISING = auto()    # Is ready for or in a denoise model run
+    SAVING = auto()       # Is ready for or in a save model run
+    FINISHED = auto()
+    
+class RunType(Enum):
+    PREFILL = auto()
+    DENOISE = auto()
+
+
+class Sequence:
+    default_block_size = 256
+    block_size = default_block_size
+    counter = count()
+
+    def __init__(self, prompt_token_ids: list[int], mask_token_id: int, sampling_params=SamplingParams(), block_size: int | None = None):
+        self.seq_id = next(Sequence.counter)
+        if block_size is not None:
+            self.block_size = block_size
+        self.block_length = sampling_params.block_length
+        self.prompt_token_ids = prompt_token_ids
+        prompt_len = len(self.prompt_token_ids)
+        
+        self.num_prefill_tokens = (prompt_len // self.block_length) * self.block_length
+        prefill_part = self.prompt_token_ids[:self.num_prefill_tokens]
+        
+        first_denoise_part = self.prompt_token_ids[self.num_prefill_tokens:]
+        self.generation_start_index = len(first_denoise_part)
+        
+        self.token_ids = prefill_part
+        self.num_tokens = len(self.token_ids)
+        self.num_prompt_tokens = prompt_len # Keep track of the original full prompt length
+        self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
+        
+        self.intermediate_block_tokens = first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part))
+        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
+        
+        self.num_to_transfer = 0
+        self.current_denoising_step = 0
+
+        self.trajectory: list[int] = []
+        self.block_trajectory: list[int] | None = [0] * len(self.intermediate_block_tokens)
+        self.global_denoising_step = 0
+        
+        # NEW: Add logprobs and entropies tracking
+        self.logprobs: list[float] = []
+        self.block_logprobs: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        
+        self.entropies: list[float] = []
+        self.block_entropies: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        
+        # initial status based on whether prefill is needed.
+        if self.num_prefill_tokens > 0:
+            self.status = SequenceStatus.WAITING
+        else:
+            self.status = SequenceStatus.DENOISING
+
+        # Block Diffusion parameters
+        self.temperature = sampling_params.temperature
+        self.stop_words = sampling_params.stop_words if sampling_params.stop_words is not None else []
+        self.stop_words = set(self.stop_words)
+        self.top_k = sampling_params.topk
+        self.top_p = sampling_params.topp
+        self.max_tokens = sampling_params.max_tokens
+        self.ignore_eos = sampling_params.ignore_eos
+        self.denoising_steps = sampling_params.denoising_steps
+        self.remasking_strategy = sampling_params.remasking_strategy
+        self.dynamic_threshold = sampling_params.dynamic_threshold
+        self.eb_threshold = sampling_params.eb_threshold
+        self.mask_token_id = mask_token_id
+        self.num_transfer_tokens_per_step = self._get_num_transfer_tokens()
+
+        # State for KV Caching
+        self.num_cached_tokens = 0
+        self.block_table = []
+
+    def __len__(self):
+        return self.num_tokens
+
+    def __getitem__(self, key):
+        return self.token_ids[key]
+
+    def _get_num_transfer_tokens(self):
+        base = self.block_length // self.denoising_steps
+        remainder = self.block_length % self.denoising_steps
+        num_tokens = [base] * self.denoising_steps
+        for i in range(remainder):
+            num_tokens[i] += 1
+        return num_tokens
+
+    def start_new_block(self):
+        self.current_denoising_step = 0
+        self.intermediate_block_tokens = [self.mask_token_id] * self.block_length
+        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
+        self.block_trajectory = [0] * self.block_length
+        self.block_logprobs = [0.0] * self.block_length
+        self.block_entropies = [0.0] * self.block_length
+        self.status = SequenceStatus.DENOISING
+
+    def commit_block(self, block_tokens: list[int]):
+        # Trim block if it exceeds max_tokens or contains EOS
+        # final_block = []
+        # for i in range(self.generation_start_index, len(block_tokens)):
+        #     token_id = block_tokens[i]
+        #     # specify where to start generating within the first decoding block
+        #     if (not self.ignore_eos) and (token_id in self.stop_words):
+        #         final_block.append(token_id)
+        #         self.status = SequenceStatus.FINISHED
+        #         break
+        #     if self.num_completion_tokens + len(final_block) >= self.max_tokens:
+        #         self.status = SequenceStatus.FINISHED
+        #         break
+        #     final_block.append(token_id)
+            
+        start = self.generation_start_index
+        # how many tokens we're still allowed to emit
+        remaining = self.max_tokens - self.num_completion_tokens
+        if remaining <= 0:
+            self.status = SequenceStatus.FINISHED
+            return []
+
+        # find earliest stop position (inclusive of the stop token)
+        stop_pos = None
+        if (not self.ignore_eos) and self.stop_words:
+            # find the first index j >= start with block_tokens[j] in stop_words
+            stop_pos = next(
+                (j for j, tok in enumerate(block_tokens[start:], start)
+                if tok in self.stop_words),
+                None
+            )
+
+        # compute cut by limits
+        end_by_tokens = start + remaining
+        end_by_stop = (stop_pos + 1) if stop_pos is not None else len(block_tokens)
+        end = min(len(block_tokens), end_by_tokens, end_by_stop)
+
+        # mirror original semantics: FINISHED if stopped by limit or stop token
+        if end == end_by_tokens or (stop_pos is not None and end == stop_pos + 1):
+            self.status = SequenceStatus.FINISHED
+        self.generation_start_index = 0  # after the first decoding block
+            
+        before_ntok = self.num_tokens
+        self.token_ids.extend(block_tokens)
+        self.num_tokens = len(self.token_ids)
+        self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
+        self.intermediate_block_tokens = []
+        self.intermediate_block_tokens_entropy =[]
+        
+        block_len = len(block_tokens)
+        if self.block_trajectory is not None:
+            block_start = max(0, self.num_prompt_tokens - before_ntok)
+            start = min(block_start, block_len)
+            if start < block_len:
+                self.trajectory.extend(self.block_trajectory[start:block_len])
+                if self.block_logprobs is not None:
+                    self.logprobs.extend(self.block_logprobs[start:block_len])
+                if self.block_entropies is not None:
+                    self.entropies.extend(self.block_entropies[start:block_len])
+ 
+            self.block_trajectory = None
+            self.block_logprobs = None
+
+        if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
+             self.status = SequenceStatus.FINISHED
+
+    def get_len_for_next_step(self):
+        return self.num_tokens + self.block_length
+
+    def num_new_blocks_needed(self, block_size: int) -> int:
+        needed_total_blocks = (self.num_tokens + self.block_length + block_size - 1) // block_size
+        return max(0, needed_total_blocks - len(self.block_table))
+
+    @property
+    def is_finished(self):
+        return self.status == SequenceStatus.FINISHED
+
+    @property
+    def num_completion_tokens(self):
+        return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def completion_token_ids(self):
+        return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def num_cached_blocks(self):
+        return self.num_cached_tokens // self.block_size
+
+    @property
+    def num_blocks(self):
+        return (self.num_tokens + self.block_size - 1) // self.block_size
+
+    @property
+    def last_block_num_tokens(self):
+        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+    def block(self, i):
+        assert 0 <= i < self.num_blocks
+        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+
+    def append_token(self, token_id: int):
+        self.token_ids.append(token_id)
+        self.last_token = token_id
+        self.num_tokens += 1
+
+    def __getstate__(self):
+        # Simplified for multiprocessing; customize as needed
+        return (
+            self.seq_id,
+            self.status,
+            self.token_ids,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.intermediate_block_tokens,
+            self.current_denoising_step,
+            self.block_size,
+        )
+    def __setstate__(self, state):
+        if len(state) == 9:
+            (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens,
+             self.num_cached_tokens, self.block_table, self.intermediate_block_tokens,
+             self.current_denoising_step) = state
+            self.block_size = Sequence.default_block_size
+        else:
+            (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens,
+             self.num_cached_tokens, self.block_table, self.intermediate_block_tokens,
+             self.current_denoising_step, self.block_size) = state
