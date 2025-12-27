@@ -63,9 +63,9 @@ class SDARAttention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # Always create q_norm and k_norm for SDAR (unlike Qwen3 which makes it conditional)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -74,16 +74,27 @@ class SDARAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        # BlockAttention expects: q, k, v with shapes (seq_len, num_heads, head_dim)
+        
+        # Normalize Q and K with head-aware view, then restore flattened shape
+        q_by_head = q.view(-1, self.num_heads, self.head_dim)
+        q_by_head = self.q_norm(q_by_head)
+        q = q_by_head.view(q.shape)
+        
+        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        k = k_by_head.view(k.shape)
+        
+        # Apply rotary embeddings (need to view for rotary_emb)
+        q_for_rope = q.view(-1, self.num_heads, self.head_dim)
+        k_for_rope = k.view(-1, self.num_kv_heads, self.head_dim)
+        q_for_rope, k_for_rope = self.rotary_emb(positions, q_for_rope, k_for_rope)
+        
+        # Flatten back for BlockAttention input
+        q = q_for_rope.view(q.shape)
+        k = k_for_rope.view(k.shape)
+        
+        # BlockAttention expects flattened inputs and returns flattened output
         o = self.attn(q, k, v)
-        # o shape: (seq_len, num_heads*head_dim) after BlockAttention processing
         output = self.o_proj(o)
         return output
 

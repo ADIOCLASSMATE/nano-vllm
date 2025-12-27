@@ -87,6 +87,11 @@ class BlockAttention(Attention):
     This attention mechanism implements the block-based sparse attention pattern
     used by SDAR models, with sparse attention during prefill and local attention
     during decode phases.
+    
+    Expected input shapes:
+        q: (seq_len, num_heads*head_dim) - flattened, will be reshaped internally
+        k: (seq_len, num_kv_heads*head_dim) - flattened, will be reshaped internally
+        v: (seq_len, num_kv_heads*head_dim) - flattened, will be reshaped internally
     """
     
     def __init__(
@@ -101,11 +106,19 @@ class BlockAttention(Attention):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """Forward pass for block-aware attention.
         
-        Expected input shapes (already viewed):
-            q: (seq_len, num_heads, head_dim)
-            k: (seq_len, num_kv_heads, head_dim)
-            v: (seq_len, num_kv_heads, head_dim)
+        Expected input shapes (flattened):
+            q: (seq_len, num_heads*head_dim)
+            k: (seq_len, num_kv_heads*head_dim)
+            v: (seq_len, num_kv_heads*head_dim)
+        
+        Returns:
+            o: (seq_len, num_heads*head_dim)
         """
+        # Reshape inputs to separate head dimension
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         
@@ -145,16 +158,13 @@ class BlockAttention(Attention):
                 if seq_len < padded_len:
                     pad_len = padded_len - seq_len
                     q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len))
-                    # k, v are cached, not padded
                 
                 q = q.view(num_blocks, block_len, self.num_heads, self.head_dim)
-                # Use flash attention with cache and optional block-local masking
+                # Use flash attention with cache and block-local masking
                 o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache,
                                             cache_seqlens=context.context_lens,
                                             block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=False)
-                # Reshape back to sequence format
-                o = o.reshape(-1, self.num_heads * self.head_dim)
             else:
                 # Standard decode attention
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
@@ -162,4 +172,6 @@ class BlockAttention(Attention):
                                             block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True)
         
+        # Reshape output to flattened format for compatibility with o_proj
+        o = o.view(-1, self.num_heads * self.head_dim)
         return o
