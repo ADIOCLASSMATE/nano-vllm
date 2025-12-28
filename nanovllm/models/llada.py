@@ -48,7 +48,7 @@ class LladaDecoderLayer(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=config.max_sequence_length,
+            max_position=getattr(config, "max_position_embeddings", config.max_sequence_length),
             base=getattr(config, "rope_theta", 500000.0),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
@@ -93,7 +93,14 @@ class LladaDecoderLayer(nn.Module):
             
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        
+        # Reshape q and k for rotary embeddings, then restore flattened shape
+        q_for_rope = q.view(-1, self.num_heads, self.head_dim)
+        k_for_rope = k.view(-1, self.num_kv_heads, self.head_dim)
+        q_for_rope, k_for_rope = self.rotary_emb(positions, q_for_rope, k_for_rope)
+        q = q_for_rope.view(q.shape)
+        k = k_for_rope.view(k.shape)
+        
         o = self.attn(q, k, v)
         hidden_states = self.attn_out(o)
         
@@ -140,6 +147,7 @@ class LladaModel(nn.Module):
 class LladaForCausalLM(nn.Module):
     """
     Top-level Llada model wrapper for causal language modeling.
+    Uses nested structure to match weight file paths: model.transformer.xxx
     """
     
     # Mapping for fused weight loading
@@ -153,16 +161,18 @@ class LladaForCausalLM(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        self.model = LladaModel(config)
+        # Create nested structure to match weight file paths: model.transformer.xxx
+        self.model = nn.Module()
+        self.model.transformer = LladaModel(config)
                 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
+        hidden_states = self.model.transformer(input_ids, positions)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.model.ff_out(hidden_states)
+        logits = self.model.transformer.ff_out(hidden_states)
         return logits

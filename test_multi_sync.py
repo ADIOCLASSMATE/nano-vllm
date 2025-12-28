@@ -34,16 +34,10 @@ def apply_template(tokenizer: AutoTokenizer, prompts: list[str]) -> list[str]:
         for prompt in prompts
     ]
 
-def main():
-    model_base_dir = "/inspire/hdd/global_user/donglinkang-253108120084/.cache/modelscope/hub/models"
-    
+def main():    
     # List of models to sync sequentially
     target_models = [
-        f"{model_base_dir}/Qwen/Qwen2.5-1.5B",
-        f"{model_base_dir}/Qwen/Qwen2.5-1.5B-Instruct",
-        f"{model_base_dir}/Qwen/Qwen2.5-Math-1.5B",
-        f"{model_base_dir}/Qwen/Qwen2.5-Math-1.5B-Instruct",
-        f"{model_base_dir}/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        f"public/models/SDAR/SDAR-8B-Chat",
     ]
     
     test_prompts = [
@@ -80,6 +74,7 @@ def main():
                 model_path,
                 dtype=torch.bfloat16,
                 device_map="cuda:0",
+                trust_remote_code=True,
             )
             source_tokenizer = AutoTokenizer.from_pretrained(model_path)
             load_duration = time.perf_counter() - start_load

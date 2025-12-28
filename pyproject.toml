@@ -13,20 +13,20 @@ description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "triton>=3.0.0",
-    "transformers>=4.51.0",
+    "transformers==4.56.0",
     "xxhash",
     "nvitop>=1.6.0",
-    "flash-attn>=2.8.3",
     "torch==2.8.0",
     "vllm>=0.11.0",
     "accelerate>=1.12.0",
+    "flash-attn>=2.8.3",
 ]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
 [[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple"
+url = "http://nexus.sii.shaipower.online/repository/pypi/simple"
 default = true
 
 [tool.setuptools.packages.find]

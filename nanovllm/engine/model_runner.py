@@ -41,6 +41,9 @@ class ModelRunner:
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
         
+        # Save dtype to hf_config for later use (e.g., in allocate_kv_cache)
+        hf_config.dtype = dtype
+        
         # Select model based on config
         model_type = hf_config.model_type.lower() if hasattr(hf_config, 'model_type') else 'qwen'
         if 'sdar' in model_type:
@@ -125,12 +128,25 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # Support both num_key_value_heads (Qwen/SDAR) and n_kv_heads (Llada)
+        num_kv_heads_total = getattr(hf_config, 'num_key_value_heads', None) or getattr(hf_config, 'n_kv_heads', None)
+        assert num_kv_heads_total is not None, f"Config has neither 'num_key_value_heads' nor 'n_kv_heads'"
+        num_kv_heads = num_kv_heads_total // self.world_size
+        # Support both hidden_size (Qwen/SDAR) and d_model (Llada)
+        hidden_size = getattr(hf_config, 'hidden_size', None) or getattr(hf_config, 'd_model', None)
+        # Support both num_attention_heads and n_heads
+        num_attention_heads = getattr(hf_config, 'num_attention_heads', None) or getattr(hf_config, 'n_heads', None)
+        head_dim = getattr(hf_config, "head_dim", hidden_size // num_attention_heads)
+        # Support both num_hidden_layers and n_layers
+        num_hidden_layers = getattr(hf_config, 'num_hidden_layers', None) or getattr(hf_config, 'n_layers', None)
+        # Get dtype with fallback
+        dtype_obj = getattr(hf_config, 'dtype', None) or torch.float16
+        if isinstance(dtype_obj, str):
+            dtype_obj = getattr(torch, dtype_obj.replace("torch.", ""))
+        block_bytes = 2 * num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype_obj.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -384,7 +400,9 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # Support both hidden_size (Qwen/SDAR) and d_model (Llada)
+        output_dim = getattr(hf_config, 'hidden_size', None) or getattr(hf_config, 'd_model', None)
+        outputs = torch.zeros(max_bs, output_dim)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

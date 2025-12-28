@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 import atexit
 from dataclasses import fields
 from time import perf_counter

@@ -8,13 +8,7 @@ else:
     from nanovllm import LLM, SamplingParams
 
 def main():
-    # path = "models/Qwen/Qwen3-0.6B-Base"
-    # path = "models/Qwen/Qwen3-0.6B"
-    # path = "models/Qwen/Qwen2.5-1.5B"
-    # path = "models/Qwen/Qwen2.5-1.5B-Instruct"
-    # path = "models/Qwen/Qwen2.5-Math-1.5B"
-    path = "models/Qwen/Qwen2.5-Math-1.5B-Instruct"
-    # path = "models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    path = "public/models/Qwen/Qwen3-4B"
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True) # default tensor_parallel_size=1
     # llm = LLM(path, enforce_eager=True, tensor_parallel_size=8)
