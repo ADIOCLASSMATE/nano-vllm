@@ -461,3 +461,96 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
+        """Update model parameters by broadcasting full weights via NCCL.
+        
+        Rank 0 sends full (unsharded) weights to all ranks via NCCL broadcast.
+        Each rank then applies its own weight_loader to handle tensor parallel sharding.
+        
+        Args:
+            param_dict: A dictionary mapping parameter names to new tensor values.
+                       These should be FULL (unsharded) weights from the source model.
+        """
+        if self.world_size == 1:
+            # Single GPU: use weight_loader directly
+            self._apply_weights_with_loader(param_dict)
+            return
+        
+        # Multi-GPU: broadcast weights via NCCL
+        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
+        
+        for weight_name, full_weight in param_dict.items():
+            # Convert to appropriate dtype and device
+            dtype = full_weight.dtype
+            full_weight_cuda = full_weight.to(device='cuda', dtype=dtype)
+            
+            # Broadcast from rank 0
+            if self.tp_group is not None:
+                dist.broadcast(full_weight_cuda, src=0, group=self.tp_group)
+            else:
+                dist.broadcast(full_weight_cuda, src=0)
+            
+            # Now apply with weight_loader (each rank shards differently based on tp_rank)
+            self._apply_single_weight(weight_name, full_weight_cuda, packed_modules_mapping)
+            
+            # Free memory
+            del full_weight_cuda
+        
+        if self.tp_group is not None:
+            dist.barrier(group=self.tp_group)
+        else:
+            dist.barrier()
+
+    def _apply_weights_with_loader(self, param_dict: dict[str, torch.Tensor]):
+        """Apply weights using weight_loader (single GPU path)."""
+        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
+        for weight_name, tensor in param_dict.items():
+            self._apply_single_weight(weight_name, tensor, packed_modules_mapping)
+
+    def _apply_single_weight(self, weight_name: str, tensor: torch.Tensor, packed_modules_mapping: dict):
+        """Apply a single weight using the appropriate weight_loader."""
+        from jetengine.utils.loader import _is_moe_expert_weight, _load_expert_weight_to_fused
+        
+        # Check if this weight is part of a packed module (e.g., q_proj -> qkv_proj)
+        for k, (v, shard_id) in packed_modules_mapping.items():
+            if k in weight_name:
+                param_name = weight_name.replace(k, v)
+                # Handle MoE expert weights
+                if _is_moe_expert_weight(param_name):
+                    try:
+                        _load_expert_weight_to_fused(self.model, param_name, tensor, shard_id)
+                    except (AttributeError, KeyError):
+                        pass
+                else:
+                    try:
+                        param = self.model.get_parameter(param_name)
+                        weight_loader = getattr(param, "weight_loader", None)
+                        if weight_loader is not None:
+                            with torch.no_grad():
+                                weight_loader(param, tensor, shard_id)
+                    except AttributeError:
+                        pass
+                break
+        else:
+            # Not a packed module
+            # Handle MoE expert weights
+            if _is_moe_expert_weight(weight_name):
+                try:
+                    _load_expert_weight_to_fused(self.model, weight_name, tensor)
+                except (AttributeError, KeyError):
+                    pass
+            else:
+                # Load directly with weight_loader
+                try:
+                    param = self.model.get_parameter(weight_name)
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is not None:
+                        with torch.no_grad():
+                            weight_loader(param, tensor)
+                    else:
+                        # Fallback: direct copy (for non-sharded params like layernorm)
+                        with torch.no_grad():
+                            param.data.copy_(tensor.to(param.device, param.dtype))
+                except AttributeError:
+                    pass

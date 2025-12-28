@@ -151,9 +151,23 @@ class BlockAttention(Attention):
             q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
             k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
             v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            # Ensure block_tables is not None and has correct shape
+            if context.block_tables is None:
+                # Create a dummy block_table for warmup (all zeros means no valid blocks)
+                batch_size = q.shape[0]
+                max_num_blocks = 1  # Minimum required
+                block_tables = torch.zeros(batch_size, max_num_blocks, dtype=torch.int32, device=q.device)
+            else:
+                block_tables = context.block_tables
+                # Ensure block_tables has correct shape: (batch_size, max_num_blocks_per_seq)
+                if block_tables.shape[0] != q.shape[0]:
+                    # Reshape block_tables to match batch size
+                    batch_size = q.shape[0]
+                    max_num_blocks = block_tables.shape[1]
+                    block_tables = block_tables[:batch_size]
             o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
                                         cache_seqlens=context.context_lens,
-                                        block_table=context.block_tables,
+                                        block_table=block_tables,
                                         softmax_scale=self.scale, causal=False)
         
         # Reshape output to flattened format for compatibility with o_proj
