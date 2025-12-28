@@ -99,8 +99,8 @@ class LladaDecoderLayer(nn.Module):
         q_reshaped = q.view(-1, self.num_heads, self.head_dim)
         k_reshaped = k.view(-1, self.num_kv_heads, self.head_dim)
         q_reshaped, k_reshaped = self.rotary_emb(positions, q_reshaped, k_reshaped)
-        q = q_reshaped.reshape(q.shape)
-        k = k_reshaped.reshape(k.shape)
+        q = q_reshaped.view(q.shape)
+        k = k_reshaped.view(k.shape)
         
         # Pass flattened q, k, v to attention (LladaBlockAttention will reshape internally)
         o = self.attn(q, k, v)

@@ -172,7 +172,9 @@ class BlockAttention(Attention):
                                             softmax_scale=self.scale, causal=True)
         
         # Reshape output to flattened format for compatibility with o_proj
-        o = o.view(-1, self.num_heads * self.head_dim)
+        # Ensure contiguous memory layout before reshaping, especially important after
+        # block-local attention in denoise phase which may create non-contiguous tensors
+        o = o.reshape(-1, self.num_heads * self.head_dim)
         return o
 
 
@@ -265,5 +267,7 @@ class LladaBlockAttention(Attention):
                                             softmax_scale=self.scale, causal=True)
         
         # Reshape output to flattened format for compatibility with o_proj
-        o = o.view(-1, self.num_heads * self.head_dim)
+        # Ensure contiguous memory layout before reshaping, especially important after
+        # block-local attention in denoise phase which may create non-contiguous tensors
+        o = o.reshape(-1, self.num_heads * self.head_dim)
         return o

@@ -84,14 +84,8 @@ class SDARAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         
-        # Apply rotary embeddings (need to view for rotary_emb)
-        q_for_rope = q.view(-1, self.num_heads, self.head_dim)
-        k_for_rope = k.view(-1, self.num_kv_heads, self.head_dim)
-        q_for_rope, k_for_rope = self.rotary_emb(positions, q_for_rope, k_for_rope)
-        
-        # Flatten back for BlockAttention input
-        q = q_for_rope.view(q.shape)
-        k = k_for_rope.view(k.shape)
+        # Apply rotary embeddings directly on flattened q, k
+        q, k = self.rotary_emb(positions, q, k)
         
         # BlockAttention expects flattened inputs and returns flattened output
         o = self.attn(q, k, v)
@@ -141,7 +135,7 @@ class SDARDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
+            qkv_bias=getattr(config, 'attention_bias', False),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
