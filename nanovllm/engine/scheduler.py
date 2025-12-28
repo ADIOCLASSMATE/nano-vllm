@@ -31,8 +31,10 @@ class Scheduler:
         Returns:
             (seqs, is_prefill, run_type)
             is_prefill: backward compatibility flag (True for PREFILL, False for DENOISE/DECODE)
-            run_type: RunType.PREFILL or RunType.DENOISE
+            run_type: RunType.PREFILL, RunType.DENOISE, or standard DECODE
         """
+        from nanovllm.utils.context import RunType
+        
         # Prefill phase: process waiting sequences with prompt prefill
         scheduled_seqs = []
         num_seqs = 0
@@ -63,7 +65,7 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, False, RunType.DENOISE
 
-        # Decode phase: standard token-by-token decoding
+        # Decode phase: standard token-by-token decoding for Qwen3 and other autoregressive models
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
@@ -78,12 +80,15 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
-            # No sequences available - this should not happen in normal flow
-            # as step() should only be called when there's work
-            return [], False, RunType.DENOISE
+            # No sequences available
+            return [], False, RunType.PREFILL  # Return PREFILL as safe default
         
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False, RunType.DENOISE
+        # Determine run_type based on sequence properties
+        # If sequence has intermediate_block_tokens (LLADA/SDAR), it's DENOISE
+        # Otherwise it's standard DECODE (Qwen3)
+        run_type = RunType.DENOISE if scheduled_seqs and scheduled_seqs[0].intermediate_block_tokens is not None else RunType.PREFILL
+        return scheduled_seqs, False, run_type
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -97,7 +102,7 @@ class Scheduler:
         
         For PREFILL: data is token_ids list, update cached tokens
         For DENOISE: data is logits tensor (B*L, vocab_size), sample and update blocks
-        For DECODE: data is token_ids list, append one token per sequence
+        For DECODE: data is token_ids list, append one token per sequence (standard autoregressive)
         """
         from nanovllm.utils.context import RunType
         
@@ -108,21 +113,16 @@ class Scheduler:
             # data is logits tensor (B*L, vocab_size)
             self._postprocess_denoise(seqs, data)
         else:
-            # data is token_ids list
+            # data is token_ids list (PREFILL or standard DECODE)
             token_ids = data
-            if any(seq.intermediate_block_tokens is not None and seq.status == SequenceStatus.DENOISING for seq in seqs):
-                # This shouldn't happen in normal flow - DENOISE should return logits
-                # But handle it gracefully
-                pass
-            else:
-                # Standard DECODE phase: one token per sequence
-                for seq, token_id in zip(seqs, token_ids or []):
-                    seq.append_token(token_id)
-                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                        seq.status = SequenceStatus.FINISHED
-                        self.block_manager.deallocate(seq)
-                        if seq in self.running:
-                            self.running.remove(seq)
+            # Standard DECODE phase: one token per sequence (for Qwen3, etc.)
+            for seq, token_id in zip(seqs, token_ids or []):
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    if seq in self.running:
+                        self.running.remove(seq)
     
     def _postprocess_denoise(self, seqs: list[Sequence], logits: torch.Tensor):
         """Handle denoise phase sampling and token updates with advanced remasking strategies.

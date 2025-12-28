@@ -325,33 +325,36 @@ class ModelRunner:
         
         Adapted from jetengine/engine/model_runner.py:403
         
-        For PREFILL/DECODE: returns sampled token_ids (list[int])
+        For PREFILL: returns sampled token_ids (list[int])
         For DENOISE: returns raw logits tensor (B*L, vocab_size) for scheduler to handle
+        For DECODE: returns sampled token_ids (list[int]) - standard autoregressive (Qwen3)
         """
         from nanovllm.utils.context import RunType
         
         if run_type is None:
             # Backward compatibility
-            run_type = RunType.PREFILL if is_prefill else RunType.DENOISE
+            run_type = RunType.PREFILL if is_prefill else RunType.PREFILL
         
         if run_type == RunType.PREFILL:
             input_ids, positions = self.prepare_prefill(seqs)
+            logits = self.run_model(input_ids, positions, is_prefill=True)
+            temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
+            token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+            reset_context()
+            return token_ids
+        
         elif run_type == RunType.DENOISE:
+            # DENOISE: return raw logits for scheduler to handle
             input_ids, positions = self.prepare_denoise(seqs)
-        else:
-            # Standard decode (not PREFILL or DENOISE)
-            input_ids, positions = self.prepare_decode(seqs)
-        
-        logits = self.run_model(input_ids, positions, is_prefill)
-        
-        # Only PREFILL/DECODE paths sample here; DENOISE sampling is in scheduler.postprocess
-        if run_type == RunType.DENOISE:
-            # Return raw logits for scheduler to handle
+            logits = self.run_model(input_ids, positions, is_prefill=False)
             reset_context()
             return logits
+        
         else:
-            # PREFILL and DECODE: sample tokens here
-            temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
+            # Standard DECODE phase (autoregressive, e.g., Qwen3)
+            input_ids, positions = self.prepare_decode(seqs)
+            logits = self.run_model(input_ids, positions, is_prefill=False)
+            temperatures, top_ps = self.prepare_sample(seqs, RunType.PREFILL) if self.rank == 0 else (None, None)
             token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
             reset_context()
             return token_ids
