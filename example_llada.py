@@ -12,6 +12,7 @@ def main():
         tensor_parallel_size=1, 
         mask_token_id=126336, 
         block_length=1024, 
+        max_num_seqs=32,
         gpu_memory_utilization=0.9
         )
     sampling_params = SamplingParams(
