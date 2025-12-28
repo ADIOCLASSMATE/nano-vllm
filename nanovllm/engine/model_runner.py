@@ -117,8 +117,9 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        seqs = [Sequence([0] * max_model_len, mask_token_id=self.config.mask_token_id) for _ in range(num_seqs)]
+        from nanovllm.utils.context import RunType
+        self.run(seqs, True, RunType.PREFILL)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -195,7 +196,8 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        from nanovllm.utils.context import RunType
+        set_context(True, run_type=RunType.PREFILL, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -213,7 +215,52 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        from nanovllm.utils.context import RunType
+        set_context(False, run_type=RunType.DENOISE, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
+
+    def prepare_denoise(self, seqs: list[Sequence]):
+        """Prepare denoise block for LLADA/SDAR models.
+        
+        In denoise phase, the query is the intermediate block (with mask tokens),
+        and the context is the confirmed part of the sequence.
+        """
+        from nanovllm.utils.context import RunType
+        
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        
+        for seq in seqs:
+            # Query: intermediate block tokens
+            input_ids.extend(seq.intermediate_block_tokens)
+            
+            # Positions are relative to the global sequence
+            k_len = len(seq)  # Confirmed tokens
+            q_len = len(seq.intermediate_block_tokens)
+            positions.extend(range(k_len, k_len + q_len))
+            
+            # Context: all confirmed tokens
+            context_lens.append(k_len)
+            
+            # Slot mapping for prefill-like attention
+            if seq.block_table:
+                for i in range(q_len):
+                    block_idx = (k_len + i) // self.block_size
+                    block_offset = (k_len + i) % self.block_size
+                    physical_block_id = seq.block_table[block_idx]
+                    slot = physical_block_id * self.block_size + block_offset
+                    slot_mapping.append(slot)
+        
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        
+        set_context(False, run_type=RunType.DENOISE, slot_mapping=slot_mapping, context_lens=context_lens, 
+                   block_tables=block_tables, block_length=seqs[0].block_length if seqs else 4)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -245,8 +292,22 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], is_prefill: bool, run_type=None) -> list[int]:
+        from nanovllm.utils.context import RunType
+        
+        if run_type is None:
+            # Backward compatibility
+            run_type = RunType.PREFILL if is_prefill else RunType.DENOISE
+        
+        if run_type == RunType.PREFILL:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            # DENOISE: check if this is a denoise block or standard decode
+            if seqs and hasattr(seqs[0], 'intermediate_block_tokens') and seqs[0].intermediate_block_tokens is not None:
+                input_ids, positions = self.prepare_denoise(seqs)
+            else:
+                input_ids, positions = self.prepare_decode(seqs)
+        
         temperatures, top_ps = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None

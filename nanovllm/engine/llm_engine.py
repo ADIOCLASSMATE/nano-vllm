@@ -52,12 +52,12 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, mask_token_id=self.scheduler.config.mask_token_id)
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        seqs, is_prefill, run_type = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", seqs, is_prefill, run_type)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)

@@ -94,13 +94,15 @@ class LladaDecoderLayer(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
-        # Reshape q and k for rotary embeddings, then restore flattened shape
-        q_for_rope = q.view(-1, self.num_heads, self.head_dim)
-        k_for_rope = k.view(-1, self.num_kv_heads, self.head_dim)
-        q_for_rope, k_for_rope = self.rotary_emb(positions, q_for_rope, k_for_rope)
-        q = q_for_rope.view(q.shape)
-        k = k_for_rope.view(k.shape)
+        # Apply rotary embeddings on flattened format
+        # reshape -> rotary -> reshape back to flattened
+        q_reshaped = q.view(-1, self.num_heads, self.head_dim)
+        k_reshaped = k.view(-1, self.num_kv_heads, self.head_dim)
+        q_reshaped, k_reshaped = self.rotary_emb(positions, q_reshaped, k_reshaped)
+        q = q_reshaped.reshape(q.shape)
+        k = k_reshaped.reshape(k.shape)
         
+        # Pass flattened q, k, v to attention (LladaBlockAttention will reshape internally)
         o = self.attn(q, k, v)
         hidden_states = self.attn_out(o)
         
