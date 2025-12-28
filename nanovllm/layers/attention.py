@@ -172,3 +172,94 @@ class BlockAttention(Attention):
         # Reshape output to flattened format for compatibility with o_proj
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
+
+
+class LladaBlockAttention(Attention):
+    """Llada variant of block-aware attention.
+    
+    Unlike BlockAttention which uses sparse_attn_varlen during prefill,
+    LladaBlockAttention uses standard flash_attn_varlen_func (full attention).
+    The decode phase remains the same with block-local attention.
+    
+    Expected input shapes:
+        q: (seq_len, num_heads*head_dim) - flattened, will be reshaped internally
+        k: (seq_len, num_kv_heads*head_dim) - flattened, will be reshaped internally
+        v: (seq_len, num_kv_heads*head_dim) - flattened, will be reshaped internally
+    """
+    
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+    ):
+        super().__init__(num_heads, head_dim, scale, num_kv_heads)
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """Forward pass for Llada block-aware attention.
+        
+        Expected input shapes (flattened):
+            q: (seq_len, num_heads*head_dim)
+            k: (seq_len, num_kv_heads*head_dim)
+            v: (seq_len, num_kv_heads*head_dim)
+        
+        Returns:
+            o: (seq_len, num_heads*head_dim)
+        """
+        # Reshape inputs to separate head dimension
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+        
+        # Store k, v to cache (both prefill and decode phases)
+        # In prefill, stores all tokens. In decode, stores just the current token(s)
+        if k_cache.numel() and v_cache.numel():
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        
+        # Prefill phase: use full attention (no sparse pattern like BlockAttention)
+        if context.is_prefill:
+            # Use standard full attention (not sparse like SDAR's BlockAttention)
+            max_seqlen_q = None
+            max_seqlen_k = None
+            if hasattr(context, 'cu_seqlens_q') and hasattr(context, 'cu_seqlens_k'):
+                # Calculate max sequence length from cu_seqlens if available
+                if context.cu_seqlens_q is not None and context.cu_seqlens_k is not None:
+                    max_seqlen_q = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).max().item()
+                    max_seqlen_k = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).max().item()
+            
+            o = flash_attn_varlen_func(q, k, v,
+                                    max_seqlen_q=max_seqlen_q,
+                                    cu_seqlens_q=context.cu_seqlens_q,
+                                    max_seqlen_k=max_seqlen_k,
+                                    cu_seqlens_k=context.cu_seqlens_k,
+                                    softmax_scale=self.scale)
+        # Decode phase: use block-local attention with cached keys/values (same as BlockAttention)
+        else:
+            if hasattr(context, 'block_length') and context.block_length is not None:
+                # Reshape to block structure for local attention
+                block_len = context.block_length
+                # Reshape q, k, v to block format: (seq_len, num_heads, head_dim) -> (num_blocks, block_len, num_heads, head_dim)
+                q = q.view(-1, block_len, self.num_heads, self.head_dim)
+                k = k.view(-1, block_len, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, block_len, self.num_kv_heads, self.head_dim)
+                
+                # Use flash attention with cache and block-local masking
+                # Note: must pass k and v for the current block, not just k_cache and v_cache
+                o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                                            cache_seqlens=context.context_lens,
+                                            block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=False)
+            else:
+                # Standard decode attention
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens,
+                                            block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
+        
+        # Reshape output to flattened format for compatibility with o_proj
+        o = o.view(-1, self.num_heads * self.head_dim)
+        return o

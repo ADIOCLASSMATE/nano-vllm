@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.sdar import SDARForCausalLM
+from nanovllm.models.llada import LladaForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -44,6 +45,8 @@ class ModelRunner:
         model_type = hf_config.model_type.lower() if hasattr(hf_config, 'model_type') else 'qwen'
         if 'sdar' in model_type:
             self.model = SDARForCausalLM(hf_config)
+        elif 'llada' in model_type:
+            self.model = LladaForCausalLM(hf_config)
         else:
             self.model = Qwen3ForCausalLM(hf_config)
         
