@@ -122,9 +122,11 @@ class BlockAttention(Attention):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         
-        # Store k, v to cache (both prefill and decode phases)
-        # In prefill, stores all tokens. In decode, stores just the current token(s)
-        if k_cache.numel() and v_cache.numel():
+        # Store k, v to cache only during PREFILL phase
+        # Adapted from jetengine: should_store_whole = (context.run_type == RunType.PREFILL)
+        # During DENOISE/DECODE, k/v are stored via flash_attn_with_kvcache internally
+        should_store_whole = context.is_prefill
+        if should_store_whole and k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         
         # Prefill phase: use sparse attention with block pattern
@@ -146,7 +148,7 @@ class BlockAttention(Attention):
                                            cu_seqlens_k=context.cu_seqlens_k,
                                            softmax_scale=self.scale, causal=True,
                                            block_table=context.block_tables)
-        # Decode phase: use block-local attention with cached keys/values
+        # Decode/Denoise phase: use block-local attention with cached keys/values
         else:
             if hasattr(context, 'block_length') and context.block_length is not None:
                 # Reshape to block structure for local attention
@@ -215,9 +217,11 @@ class LladaBlockAttention(Attention):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         
-        # Store k, v to cache (both prefill and decode phases)
-        # In prefill, stores all tokens. In decode, stores just the current token(s)
-        if k_cache.numel() and v_cache.numel():
+        # Store k, v to cache only during PREFILL phase
+        # Adapted from jetengine: should_store_whole = (context.run_type == RunType.PREFILL)
+        # During DENOISE/DECODE, k/v are stored via flash_attn_with_kvcache internally
+        should_store_whole = context.is_prefill
+        if should_store_whole and k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         
         # Prefill phase: use full attention (no sparse pattern like BlockAttention)
@@ -237,7 +241,7 @@ class LladaBlockAttention(Attention):
                                     max_seqlen_k=max_seqlen_k,
                                     cu_seqlens_k=context.cu_seqlens_k,
                                     softmax_scale=self.scale)
-        # Decode phase: use block-local attention with cached keys/values (same as BlockAttention)
+        # Decode/Denoise phase: use block-local attention with cached keys/values (same as BlockAttention)
         else:
             if hasattr(context, 'block_length') and context.block_length is not None:
                 # Reshape to block structure for local attention
