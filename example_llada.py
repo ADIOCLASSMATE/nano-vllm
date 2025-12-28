@@ -6,11 +6,24 @@ from transformers import AutoTokenizer
 def main():
     path = os.path.expanduser("./public/models/LLaDA/LLaDA-8B-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    llada_block_size = 4
-    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=126336, block_length=llada_block_size, max_num_seqs=512, max_model_len=4096, gpu_memory_utilization=0.8)
-    sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096,
-                                     remasking_strategy="low_confidence_dynamic", dynamic_threshold=0.9,
-                                     block_length=llada_block_size, denoising_steps=llada_block_size)
+    llm = LLM(
+        path, 
+        enforce_eager=False, 
+        tensor_parallel_size=1, 
+        mask_token_id=126336, 
+        block_length=1024, 
+        gpu_memory_utilization=0.9
+        )
+    sampling_params = SamplingParams(
+        temperature=1.0, 
+        topk=0, 
+        topp=1.0, 
+        max_tokens=2048,
+        remasking_strategy="low_confidence_dynamic", 
+        block_length=1024, 
+        denoising_steps=1024, 
+        dynamic_threshold=0.90
+        )
 
     questions = [
         "Consider the geometric sequence frac{125}{9}, frac{25}{3}, 5, 3, ... What is the eighth term of the sequence? Express your answer as a common fraction.",

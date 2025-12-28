@@ -50,18 +50,16 @@ def main():
         "If a snack-size tin of peaches has 40 calories and is 2% of a person's daily caloric requirement, how many calories fulfill a person's daily caloric requirement?",
     ]
     
-    # SDAR-specific sampling parameters (matching example_sdar.py)
-    llada_block_size = 4
     sampling_params = SamplingParams(
-        temperature=1.0,
-        topk=0,
-        topp=1.0,
-        max_tokens=512,  # Reduced for testing
-        remasking_strategy="low_confidence_dynamic",
-        dynamic_threshold=0.9,
-        block_length=llada_block_size,
-        denoising_steps=llada_block_size
-    )
+        temperature=1.0, 
+        topk=0, 
+        topp=1.0, 
+        max_tokens=2048,
+        remasking_strategy="low_confidence_dynamic", 
+        block_length=1024, 
+        denoising_steps=1024, 
+        dynamic_threshold=0.90)
+
 
     console.print(Panel.fit("[bold blue]SDAR Model Weight Synchronization Test[/bold blue]", border_style="blue"))
 
@@ -80,15 +78,14 @@ def main():
     with console.status(f"[bold cyan]Initializing jetengine with {os.path.basename(initial_model_path)}...") as status:
         start = time.perf_counter()
         llm = LLM(
-            initial_model_path,
-            enforce_eager=False,
-            tensor_parallel_size=tensor_parallel_size,
-            mask_token_id=151669,  # SDAR-specific mask token ID
-            block_length=llada_block_size,
-            max_num_seqs=32,  # Reduced for testing
-            max_model_len=2048,  # Reduced for testing
-            gpu_memory_utilization=0.8
-        )
+            initial_model_path, 
+            enforce_eager=False, 
+            tensor_parallel_size=1, 
+            mask_token_id=126336, 
+            block_length=1024, 
+            max_num_seqs=32,
+            gpu_memory_utilization=0.9)
+
         duration = time.perf_counter() - start
         console.print(f"[bold cyan]✓[/bold cyan] jetengine initialized in [yellow]{duration:.2f}s[/yellow]")
 
