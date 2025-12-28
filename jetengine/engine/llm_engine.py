@@ -5,6 +5,7 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch
+import torch.multiprocessing as mp
 from torch import nn
 from contextlib import nullcontext
 
@@ -15,7 +16,6 @@ from jetengine.engine.scheduler import Scheduler
 from jetengine.engine.model_runner import ModelRunner
 from jetengine.utils.loader import load_from_hf_model
 from jetengine.utils.statics import _estimate_kv_cache_usage, _actual_estimate_kv_cache_usage
-from jetengine.engine.distributed_manager import DistributedManager
 
 
 
@@ -36,9 +36,17 @@ class LLMEngine:
             f"of length {config.max_model_len:,} tokens."
         )
 
-        self.dist_manager = DistributedManager(config.tensor_parallel_size)
-
-        self.model_runner = ModelRunner(config, self.dist_manager)
+        # Use multiprocessing to manually create processes (like nanovllm)
+        self.ps = []
+        self.events = []
+        ctx = mp.get_context("spawn")
+        for i in range(1, config.tensor_parallel_size):
+            event = ctx.Event()
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process.start()
+            self.ps.append(process)
+            self.events.append(event)
+        self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model, use_fast=True, trust_remote_code=True)
         config.eos = self.tokenizer.eos_token_id
@@ -158,7 +166,14 @@ class LLMEngine:
             # print(f"Restored default device to {original_device}.")
 
     def exit(self):
+        if not hasattr(self, 'model_runner') or self.model_runner is None:
+            return  # Already exited
+        if hasattr(self.model_runner, 'call'):
+            self.model_runner.call("exit")
         del self.model_runner
+        self.model_runner = None
+        for p in self.ps:
+            p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -186,14 +201,14 @@ class LLMEngine:
         )
 
         if schedule_result.prefill:
-            logits = self.model_runner.run(schedule_result.prefill, RunType.PREFILL)
+            logits = self.model_runner.call("run", schedule_result.prefill, RunType.PREFILL)
             finished_sequences.extend(
                 postprocess_fn(schedule_result.prefill, logits, RunType.PREFILL)
             )
 
         tokens_generated = 0
         if schedule_result.denoise:
-            logits = self.model_runner.run(schedule_result.denoise, RunType.DENOISE)
+            logits = self.model_runner.call("run", schedule_result.denoise, RunType.DENOISE)
             finished_sequences.extend(
                 postprocess_fn(schedule_result.denoise, logits, RunType.DENOISE)
             )
@@ -227,6 +242,21 @@ class LLMEngine:
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def update_model_param(self, param_dict: dict[str, "torch.Tensor"]):
+        """Update model parameters and sync across all model runners using NCCL broadcast.
+        
+        Args:
+            param_dict: A dictionary mapping parameter names to new tensor values.
+                       Parameter names should match the source model's state_dict keys.
+                       These should be FULL (unsharded) weights.
+        
+        Note:
+            This method broadcasts full weights via NCCL (not shared memory).
+            Each rank then applies its own weight_loader to handle tensor parallel sharding.
+        """
+        # For each parameter, broadcast full weight via NCCL then each rank shards locally
+        self.model_runner.update_model_param_with_broadcast(param_dict)
 
     def generate(
         self,
