@@ -160,21 +160,6 @@ class LLMEngine:
     def exit(self):
         del self.model_runner
 
-    def update_model_param(self, param_dict: dict[str, "torch.Tensor"]):
-        """Update model parameters and sync across all model runners using NCCL broadcast.
-        
-        Args:
-            param_dict: A dictionary mapping parameter names to new tensor values.
-                       Parameter names should match the source model's state_dict keys.
-                       These should be FULL (unsharded) weights.
-        
-        Note:
-            This method broadcasts full weights via NCCL (not shared memory).
-            Each rank then applies its own weight_loader to handle tensor parallel sharding.
-        """
-        # For each parameter, broadcast full weight via NCCL then each rank shards locally
-        self.model_runner.update_model_param_with_broadcast(param_dict)
-
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
@@ -400,8 +385,7 @@ class LLMEngine:
                     "token_ids": token_ids, 
                     "trajectory": trajectory,
                     "logprobs": logprobs,  # NEW
-                    "entropies": entropies,
-                    "Throughput": f"{int(throughput)} tok/s"
+                    "entropies": entropies  # NEW
                 }
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
@@ -412,7 +396,6 @@ class LLMEngine:
             trajectory = output["trajectory"]
             logprobs = output["logprobs"]  # NEW
             entropies = output["entropies"]  # NEW
-            throughput = output["Throughput"]
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
@@ -424,8 +407,7 @@ class LLMEngine:
                 "token_ids": token_ids, 
                 "trajectory": trajectory,
                 "logprobs": logprobs,  # NEW
-                "entropies": entropies,
-                "Throughput": throughput
+                "entropies": entropies  # NEW
             })
 
         if use_tqdm:

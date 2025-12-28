@@ -19,8 +19,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 # Set environment variables
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from nanovllm import LLM
-from nanovllm.sampling_params import SamplingParams
+from jetengine import LLM
+from jetengine.sampling_params import SamplingParams
 
 console = Console()
 
@@ -37,7 +37,7 @@ def apply_template(tokenizer: AutoTokenizer, prompts: list[str]) -> list[str]:
 def main():    
     # List of models to sync sequentially
     target_models = [
-        f"public/models/SDAR/SDAR-8B-Chat",
+        f"public/models/Qwen/Qwen3-4B",
     ]
     
     test_prompts = [

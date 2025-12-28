@@ -9,7 +9,6 @@ from jetengine.engine.sequence import Sequence, RunType, SequenceStatus
 from jetengine.models.sdar import SDARForCausalLM
 from jetengine.models.sdar_moe import SDARMoeForCausalLM
 from jetengine.models.llada import LladaForCausalLM
-from jetengine.models.dream import DreamForCausalLM
 from jetengine.utils.context import set_context, get_context, reset_context
 from jetengine.utils.loader import load_model
 from jetengine.engine.distributed_manager import DistributedManager
@@ -39,10 +38,8 @@ class ModelRunner:
             self.ModelClass = SDARMoeForCausalLM
         elif "sdar" in hf_config.model_type:
             self.ModelClass = SDARForCausalLM
-        elif "llada" in hf_config.model_type.lower():
+        elif "llada" in hf_config.model_type.lower():  # <-- ADD THIS BLOCK
             self.ModelClass = LladaForCausalLM
-        elif "dream" in hf_config.model_type.lower():
-            self.ModelClass = DreamForCausalLM
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
         self.model = self.ModelClass(**model_kwargs)
@@ -291,23 +288,32 @@ class ModelRunner:
         return input_ids, positions
     
     def prepare_denoise(self, seqs: list[Sequence]):
-        block_len = len(seqs[0].intermediate_block_tokens)
         device = torch.device("cuda")
-        cached_lens_cpu = torch.tensor(
+        
+        # Optimization: Stack tensors directly from sequences (assumed to be on device or easily movable)
+        # This avoids creating a large list of integers and then converting to tensor on CPU
+        block_tokens_list = []
+        for seq in seqs:
+            t = seq.intermediate_block_tokens
+            if t.device != device:
+                t = t.to(device, non_blocking=True)
+                seq.intermediate_block_tokens = t # Update sequence state for future steps
+            block_tokens_list.append(t)
+            
+        input_ids = torch.stack(block_tokens_list).view(-1)
+
+        # Create cached_lens directly on device if possible, or move efficiently
+        # len(seq) is fast (list len), so creating tensor on CPU then moving is standard for small batches
+        # But we can try to avoid pin_memory overhead for small tensors if we want, 
+        # though pin_memory is generally good. 
+        # Let's stick to the pattern but ensure it's efficient.
+        cached_lens = torch.tensor(
             [len(seq) for seq in seqs], 
             dtype=torch.int32, 
-            pin_memory=True
+            device=device
         )
-        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
         
-        input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
-        input_ids_cpu = torch.tensor(
-            input_ids_list, 
-            dtype=torch.int64, 
-            pin_memory=True
-        ).view(-1) # Flatten to (B * L,)
-        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
-
+        block_len = seqs[0].block_length
         start_positions = cached_lens.unsqueeze(1)
         offsets = torch.arange(
             block_len, 
@@ -315,7 +321,7 @@ class ModelRunner:
             device=device
         ).unsqueeze(0)
 
-        positions = (start_positions + offsets).view(-1) # Flatten to (B * L,)
+        positions = (start_positions + offsets).view(-1)
         block_tables = self.prepare_block_tables(seqs)
 
         set_context(
@@ -434,7 +440,7 @@ class ModelRunner:
         outputs = torch.zeros(
             max_global_bs, config.hidden_size, dtype=config.torch_dtype
         )
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in [1, 2, 4, 8] if bs <= max_bs] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
@@ -461,96 +467,3 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
-
-    def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
-        """Update model parameters by broadcasting full weights via NCCL.
-        
-        Rank 0 sends full (unsharded) weights to all ranks via NCCL broadcast.
-        Each rank then applies its own weight_loader to handle tensor parallel sharding.
-        
-        Args:
-            param_dict: A dictionary mapping parameter names to new tensor values.
-                       These should be FULL (unsharded) weights from the source model.
-        """
-        if self.world_size == 1:
-            # Single GPU: use weight_loader directly
-            self._apply_weights_with_loader(param_dict)
-            return
-        
-        # Multi-GPU: broadcast weights via NCCL
-        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
-        
-        for weight_name, full_weight in param_dict.items():
-            # Convert to appropriate dtype and device
-            dtype = full_weight.dtype
-            full_weight_cuda = full_weight.to(device='cuda', dtype=dtype)
-            
-            # Broadcast from rank 0
-            if self.tp_group is not None:
-                dist.broadcast(full_weight_cuda, src=0, group=self.tp_group)
-            else:
-                dist.broadcast(full_weight_cuda, src=0)
-            
-            # Now apply with weight_loader (each rank shards differently based on tp_rank)
-            self._apply_single_weight(weight_name, full_weight_cuda, packed_modules_mapping)
-            
-            # Free memory
-            del full_weight_cuda
-        
-        if self.tp_group is not None:
-            dist.barrier(group=self.tp_group)
-        else:
-            dist.barrier()
-
-    def _apply_weights_with_loader(self, param_dict: dict[str, torch.Tensor]):
-        """Apply weights using weight_loader (single GPU path)."""
-        packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
-        for weight_name, tensor in param_dict.items():
-            self._apply_single_weight(weight_name, tensor, packed_modules_mapping)
-
-    def _apply_single_weight(self, weight_name: str, tensor: torch.Tensor, packed_modules_mapping: dict):
-        """Apply a single weight using the appropriate weight_loader."""
-        from jetengine.utils.loader import _is_moe_expert_weight, _load_expert_weight_to_fused
-        
-        # Check if this weight is part of a packed module (e.g., q_proj -> qkv_proj)
-        for k, (v, shard_id) in packed_modules_mapping.items():
-            if k in weight_name:
-                param_name = weight_name.replace(k, v)
-                # Handle MoE expert weights
-                if _is_moe_expert_weight(param_name):
-                    try:
-                        _load_expert_weight_to_fused(self.model, param_name, tensor, shard_id)
-                    except (AttributeError, KeyError):
-                        pass
-                else:
-                    try:
-                        param = self.model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loader", None)
-                        if weight_loader is not None:
-                            with torch.no_grad():
-                                weight_loader(param, tensor, shard_id)
-                    except AttributeError:
-                        pass
-                break
-        else:
-            # Not a packed module
-            # Handle MoE expert weights
-            if _is_moe_expert_weight(weight_name):
-                try:
-                    _load_expert_weight_to_fused(self.model, weight_name, tensor)
-                except (AttributeError, KeyError):
-                    pass
-            else:
-                # Load directly with weight_loader
-                try:
-                    param = self.model.get_parameter(weight_name)
-                    weight_loader = getattr(param, "weight_loader", None)
-                    if weight_loader is not None:
-                        with torch.no_grad():
-                            weight_loader(param, tensor)
-                    else:
-                        # Fallback: direct copy (for non-sharded params like layernorm)
-                        with torch.no_grad():
-                            param.data.copy_(tensor.to(param.device, param.dtype))
-                except AttributeError:
-                    pass
