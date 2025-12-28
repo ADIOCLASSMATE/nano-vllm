@@ -5,7 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.sdar import SDARForCausalLM
 from nanovllm.models.llada import LladaForCausalLM
@@ -303,22 +303,44 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        """Run model inference.
+        
+        Adapted from jetengine/engine/model_runner.py:363
+        
+        DENOISE: Always use eager (no cuda graph), no slot_mapping
+        PREFILL/DECODE: Use cuda graph with slot_mapping if available
+        """
+        from nanovllm.utils.context import RunType
+        
+        context = get_context()
+        
+        # DENOISE: always eager (flash_attn_with_kvcache handles KV internally)
+        # Other modes: eager if enforce_eager or batch too large
+        if context.run_type == RunType.DENOISE or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
+        
+        # PREFILL/DECODE: use cuda graph if available
+        bs = input_ids.size(0)
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        
+        # CRITICAL: Only fill slot_mapping in PREFILL, never in DENOISE
+        # DENOISE uses context_lens + block_tables (no slot_mapping)
+        if context.slot_mapping is not None:
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        
+        if context.context_lens is not None:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
+        
+        if context.block_tables is not None:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        
+        graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool, run_type=None) -> list[int] | torch.Tensor:
         """Run model inference for a batch of sequences.
@@ -327,37 +349,44 @@ class ModelRunner:
         
         For PREFILL: returns sampled token_ids (list[int])
         For DENOISE: returns raw logits tensor (B*L, vocab_size) for scheduler to handle
-        For DECODE: returns sampled token_ids (list[int]) - standard autoregressive (Qwen3)
+        For DECODE: returns sampled token_ids (list[int]) - standard autoregressive
         """
         from nanovllm.utils.context import RunType
         
         if run_type is None:
-            # Backward compatibility
-            run_type = RunType.PREFILL if is_prefill else RunType.PREFILL
+            # Backward compatibility: infer from is_prefill and sequence state
+            if is_prefill:
+                run_type = RunType.PREFILL
+            elif seqs and seqs[0].status == SequenceStatus.DENOISING:
+                run_type = RunType.DENOISE
+            else:
+                run_type = RunType.PREFILL  # Standard DECODE uses PREFILL for sampling
         
-        if run_type == RunType.PREFILL:
-            input_ids, positions = self.prepare_prefill(seqs)
-            logits = self.run_model(input_ids, positions, is_prefill=True)
-            temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
-            token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+        try:
+            if run_type == RunType.PREFILL:
+                # PREFILL: Use slot_mapping-based KV cache, sample tokens
+                input_ids, positions = self.prepare_prefill(seqs)
+                logits = self.run_model(input_ids, positions, is_prefill=True)
+                temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
+                token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+                return token_ids
+            
+            elif run_type == RunType.DENOISE:
+                # DENOISE: return raw logits (B*L, V) for scheduler._postprocess_denoise
+                # DO NOT sample here - sampling happens in scheduler with advanced strategies
+                input_ids, positions = self.prepare_denoise(seqs)
+                logits = self.run_model(input_ids, positions, is_prefill=False)
+                return logits
+            
+            else:
+                # Standard DECODE phase (autoregressive, e.g., Qwen3)
+                input_ids, positions = self.prepare_decode(seqs)
+                logits = self.run_model(input_ids, positions, is_prefill=False)
+                temperatures, top_ps = self.prepare_sample(seqs, RunType.PREFILL) if self.rank == 0 else (None, None)
+                token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+                return token_ids
+        finally:
             reset_context()
-            return token_ids
-        
-        elif run_type == RunType.DENOISE:
-            # DENOISE: return raw logits for scheduler to handle
-            input_ids, positions = self.prepare_denoise(seqs)
-            logits = self.run_model(input_ids, positions, is_prefill=False)
-            reset_context()
-            return logits
-        
-        else:
-            # Standard DECODE phase (autoregressive, e.g., Qwen3)
-            input_ids, positions = self.prepare_decode(seqs)
-            logits = self.run_model(input_ids, positions, is_prefill=False)
-            temperatures, top_ps = self.prepare_sample(seqs, RunType.PREFILL) if self.rank == 0 else (None, None)
-            token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
-            reset_context()
-            return token_ids
 
     def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
         """Update model parameters by broadcasting full weights via NCCL.
