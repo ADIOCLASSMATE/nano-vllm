@@ -222,53 +222,81 @@ class ModelRunner:
     def prepare_denoise(self, seqs: list[Sequence]):
         """Prepare denoise block for LLADA/SDAR models.
         
-        In denoise phase, the query is the intermediate block (with mask tokens),
-        and the context is the confirmed part of the sequence.
+        Adapted from jetengine/engine/model_runner.py:293
+        
+        In denoise phase:
+        - Query: intermediate_block_tokens (B*L tokens with mask tokens)
+        - Context: confirmed tokens (first len(seq) tokens)
+        - All denoise query positions attend to all confirmed context tokens
+        
+        Returns:
+        - input_ids: Flattened (B*L,) tensor
+        - positions: Flattened (B*L,) tensor with positions relative to confirmed context
         """
         from nanovllm.utils.context import RunType
         
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+        block_len = len(seqs[0].intermediate_block_tokens)
+        device = torch.device("cuda")
         
-        for seq in seqs:
-            # Query: intermediate block tokens
-            input_ids.extend(seq.intermediate_block_tokens)
-            
-            # Positions are relative to the global sequence
-            k_len = len(seq)  # Confirmed tokens
-            q_len = len(seq.intermediate_block_tokens)
-            positions.extend(range(k_len, k_len + q_len))
-            
-            # Context: all confirmed tokens
-            context_lens.append(k_len)
-            
-            # Slot mapping for prefill-like attention
-            if seq.block_table:
-                for i in range(q_len):
-                    block_idx = (k_len + i) // self.block_size
-                    block_offset = (k_len + i) % self.block_size
-                    physical_block_id = seq.block_table[block_idx]
-                    slot = physical_block_id * self.block_size + block_offset
-                    slot_mapping.append(slot)
+        # Prepare context_lens: number of confirmed tokens per sequence
+        cached_lens_cpu = torch.tensor(
+            [len(seq) for seq in seqs], 
+            dtype=torch.int32, 
+            pin_memory=True
+        )
+        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
         
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # Prepare input_ids: flatten all intermediate_block_tokens to (B*L,)
+        input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
+        input_ids_cpu = torch.tensor(
+            input_ids_list, 
+            dtype=torch.int64, 
+            pin_memory=True
+        ).view(-1)  # Flatten to (B*L,)
+        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
+        
+        # Prepare positions: start from cached_lens, add offsets [0, 1, ..., block_len-1]
+        start_positions = cached_lens.unsqueeze(1)  # (B, 1)
+        offsets = torch.arange(block_len, dtype=torch.int64, device=device).unsqueeze(0)  # (1, L)
+        positions = (start_positions + offsets).view(-1)  # Flatten to (B*L,)
+        
+        # Prepare block_tables for context attention
         block_tables = self.prepare_block_tables(seqs)
         
-        set_context(False, run_type=RunType.DENOISE, slot_mapping=slot_mapping, context_lens=context_lens, 
-                   block_tables=block_tables, block_length=seqs[0].block_length if seqs else 4)
+        # Set context for denoise phase
+        set_context(
+            False,
+            run_type=RunType.DENOISE,
+            context_lens=cached_lens,
+            block_tables=block_tables,
+            block_length=seqs[0].block_length if seqs else 4
+        )
+        
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
+    def prepare_sample(self, seqs: list[Sequence], run_type=None):
+        """Prepare sampling parameters.
+        
+        In PREFILL/DECODE: one parameter per sequence (N seqs)
+        In DENOISE:采样在 scheduler.postprocess 中直接处理 logits (B*L, V)
+                   不在这里处理参数
+        """
+        from nanovllm.utils.context import RunType
+        
+        if run_type is None:
+            run_type = RunType.PREFILL
+        
+        # For DENOISE, sampling is handled in scheduler.postprocess, not here
+        if run_type == RunType.DENOISE:
+            return None, None
+        
         temperatures = []
         top_ps = []
+        
         for seq in seqs:
             temperatures.append(seq.temperature)
             top_ps.append(seq.top_p)
+        
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures, top_ps
@@ -292,7 +320,14 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, run_type=None) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, run_type=None) -> list[int] | torch.Tensor:
+        """Run model inference for a batch of sequences.
+        
+        Adapted from jetengine/engine/model_runner.py:403
+        
+        For PREFILL/DECODE: returns sampled token_ids (list[int])
+        For DENOISE: returns raw logits tensor (B*L, vocab_size) for scheduler to handle
+        """
         from nanovllm.utils.context import RunType
         
         if run_type is None:
@@ -301,18 +336,25 @@ class ModelRunner:
         
         if run_type == RunType.PREFILL:
             input_ids, positions = self.prepare_prefill(seqs)
+        elif run_type == RunType.DENOISE:
+            input_ids, positions = self.prepare_denoise(seqs)
         else:
-            # DENOISE: check if this is a denoise block or standard decode
-            if seqs and hasattr(seqs[0], 'intermediate_block_tokens') and seqs[0].intermediate_block_tokens is not None:
-                input_ids, positions = self.prepare_denoise(seqs)
-            else:
-                input_ids, positions = self.prepare_decode(seqs)
+            # Standard decode (not PREFILL or DENOISE)
+            input_ids, positions = self.prepare_decode(seqs)
         
-        temperatures, top_ps = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        
+        # Only PREFILL/DECODE paths sample here; DENOISE sampling is in scheduler.postprocess
+        if run_type == RunType.DENOISE:
+            # Return raw logits for scheduler to handle
+            reset_context()
+            return logits
+        else:
+            # PREFILL and DECODE: sample tokens here
+            temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
+            token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+            reset_context()
+            return token_ids
 
     def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
         """Update model parameters by broadcasting full weights via NCCL.

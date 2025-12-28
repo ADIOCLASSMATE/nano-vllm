@@ -56,9 +56,20 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        from nanovllm.utils.context import RunType
+        
         seqs, is_prefill, run_type = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill, run_type)
-        self.scheduler.postprocess(seqs, token_ids)
+        result = self.model_runner.call("run", seqs, is_prefill, run_type)
+        
+        # For DENOISE: result is logits tensor, pass directly to postprocess
+        # For PREFILL/DECODE: result is token_ids list, needs postprocess
+        if run_type == RunType.DENOISE:
+            # result is logits (B*L, vocab_size)
+            self.scheduler.postprocess(seqs, result, run_type)
+        else:
+            # result is token_ids (list)
+            self.scheduler.postprocess(seqs, result, run_type)
+        
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens

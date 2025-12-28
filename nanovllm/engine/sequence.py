@@ -9,6 +9,7 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     DENOISING = auto()
+    SAVING = auto()
     FINISHED = auto()
 
 
@@ -70,7 +71,12 @@ class Sequence:
         self.block_entropies = [0.0] * self.block_length
         
         self.current_denoising_step = 0
+        self.global_denoising_step = 0
         self.num_to_transfer = 0
+        
+        # Tokens to transfer per denoising step
+        # Simplified: transfer block_length tokens in one step (can be customized)
+        self.num_transfer_tokens_per_step = [self.block_length] * self.denoising_steps
         
         # Determine initial status
         if self.num_prefill_tokens > 0:
