@@ -37,7 +37,7 @@ def apply_template(tokenizer: AutoTokenizer, prompts: list[str]) -> list[str]:
 def main():    
     # List of models to sync sequentially
     target_models = [
-        f"public/models/SDAR/SDAR-8B-Chat",
+        f"public/models/Qwen/Qwen3-4B",
     ]
     
     test_prompts = [
@@ -45,7 +45,10 @@ def main():
         "Write a short poem about AI.",
         "Solve for x: 3x + 5 = 14",
     ]
-    sampling_params = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=100)
+    sdar_block_size = 4
+    sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=512,
+                                    remasking_strategy="low_confidence_dynamic", dynamic_threshold=0.9,
+                                    block_length=sdar_block_size, denoising_steps=sdar_block_size)
 
     console.print(Panel.fit("[bold blue]Multi-Model Sequential Weight Sync Test[/bold blue]", border_style="blue"))
 
@@ -54,11 +57,21 @@ def main():
     with console.status(f"[bold cyan]Initializing nanovllm with {os.path.basename(initial_model_path)}...") as status:
         start = time.perf_counter()
         llm = LLM(
-            initial_model_path,
-            tensor_parallel_size=2,
+            initial_model_path, 
+            enforce_eager=False, 
+            tensor_parallel_size=2, 
+            mask_token_id=151669, 
+            block_length=sdar_block_size, 
+            max_num_seqs=512, 
+            max_model_len=512, 
             gpu_offset=1,
-            max_model_len=512,
-        )
+            gpu_memory_utilization=0.8)
+        # llm = LLM(
+        #     initial_model_path,
+        #     tensor_parallel_size=2,
+        #     gpu_offset=1,
+        #     max_model_len=512,
+        # )
         duration = time.perf_counter() - start
         console.print(f"[bold cyan]✓[/bold cyan] nanovllm initialized in [yellow]{duration:.2f}s[/yellow]")
 

@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 import torch
+from nanovllm.engine.sequence import RunType
 
 
-class RunType(Enum):
-    PREFILL = auto()
-    DENOISE = auto()
+# class RunType(Enum):
+#     PREFILL = auto()
+#     DENOISE = auto()
 
 
 @dataclass

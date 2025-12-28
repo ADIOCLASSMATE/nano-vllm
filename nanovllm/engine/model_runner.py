@@ -1,18 +1,32 @@
+import math
 import pickle
+import os
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from typing import Union, List, Optional, Any
 
+# 假设之前的 unified_sequence 中定义了 RunMode, SequenceStatus
+# 如果实际路径不同，请调整。这里统一从 nanovllm 导入
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.models.sdar import SDARForCausalLM
-from nanovllm.models.llada import LladaForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.engine.sequence import Sequence, RunType, SequenceStatus, RunMode
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+# Models
+# 假设这些模型都在 nanovllm.models 下，或者你需要根据实际路径调整
+from nanovllm.models.qwen3 import Qwen3ForCausalLM
+try:
+    from nanovllm.models.sdar import SDARForCausalLM
+    from nanovllm.models.llada import LladaForCausalLM
+except ImportError:
+    # 占位，如果用户只跑 AR 模式可能不需要这些
+    SDARForCausalLM = None
+    LladaForCausalLM = None
+    DreamForCausalLM = None
+
+from nanovllm.layers.sampler import Sampler
 
 class ModelRunner:
 
@@ -22,46 +36,57 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
-        self.gpu_offset = config.gpu_offset
+        self.gpu_offset = getattr(config, 'gpu_offset', 0)
         self.rank = rank
-        self.device_id = rank + self.gpu_offset  # Actual GPU device ID
+        self.device_id = rank + self.gpu_offset
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # Initialize Distributed Environment
+        # 注意: 这里沿用了 AR 代码的 init 方式，如果是单卡或由外部启动 dist，需调整
+        if not dist.is_initialized():
+             dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        
         torch.cuda.set_device(self.device_id)
         default_dtype = torch.get_default_dtype()
-        
-        # Get dtype from hf_config, with fallback options
-        dtype = getattr(hf_config, 'dtype', None) or \
-                getattr(hf_config, 'torch_dtype', None) or \
-                torch.float16
-        if isinstance(dtype, str):
-            dtype = getattr(torch, dtype.replace("torch.", ""))
-        
-        torch.set_default_dtype(dtype)
+        torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        # --- Model Selection Logic ---
+        model_kwargs = {"config": hf_config}
+        model_type = hf_config.model_type.lower()
         
-        # Save dtype to hf_config for later use (e.g., in allocate_kv_cache)
-        hf_config.dtype = dtype
-        
-        # Select model based on config
-        model_type = hf_config.model_type.lower() if hasattr(hf_config, 'model_type') else 'qwen'
-        if 'sdar' in model_type:
-            self.model = SDARForCausalLM(hf_config)
-        elif 'llada' in model_type:
-            self.model = LladaForCausalLM(hf_config)
+        if "qwen" in model_type:
+            self.ModelClass = Qwen3ForCausalLM
+        elif "sdar" in model_type:
+            if "moe" in model_type:
+                raise ValueError("MoE not supported for dp tp hybrid yet")
+            self.ModelClass = SDARForCausalLM
+        elif "llada" in model_type:
+            self.ModelClass = LladaForCausalLM
+        elif "dream" in model_type:
+            self.ModelClass = DreamForCausalLM
         else:
-            self.model = Qwen3ForCausalLM(hf_config)
-        
+            # Fallback or raise
+            raise ValueError(f"Unsupported model type: {hf_config.model_type}")
+
+        self.model = self.ModelClass(**model_kwargs)
         load_model(self.model, config.model)
+        
+        # Sampler for AR mode
         self.sampler = Sampler()
+
+        # Warmup & Alloc
         self.warmup_model()
         self.allocate_kv_cache()
+        
+        # CUDA Graphs
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # Shared Memory / Worker Loop (AR Style)
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -71,6 +96,10 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    # -------------------------------------------------------------------------
+    # System / IPC Methods
+    # -------------------------------------------------------------------------
+
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
@@ -78,9 +107,10 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.graph_pool, self.graph_vars
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -112,14 +142,21 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    # -------------------------------------------------------------------------
+    # Initialization & Memory
+    # -------------------------------------------------------------------------
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        max_num_batched_tokens = getattr(self.config, 'max_num_batched_tokens', 8192)
+        max_model_len = self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len, mask_token_id=self.config.mask_token_id) for _ in range(num_seqs)]
-        from nanovllm.utils.context import RunType
-        self.run(seqs, True, RunType.PREFILL)
+        
+        # Determine how to create dummy sequences based on capability
+        # AR warmup usually sufficient to warm up allocator
+        seqs = [Sequence([0] * max_model_len, sampling_params=None, mode=RunMode.AR) for _ in range(num_seqs)]
+        self.run(seqs, RunType.PREFILL) # Generic warmup
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -129,25 +166,24 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # Support both num_key_value_heads (Qwen/SDAR) and n_kv_heads (Llada)
-        num_kv_heads_total = getattr(hf_config, 'num_key_value_heads', None) or getattr(hf_config, 'n_kv_heads', None)
-        assert num_kv_heads_total is not None, f"Config has neither 'num_key_value_heads' nor 'n_kv_heads'"
-        num_kv_heads = num_kv_heads_total // self.world_size
-        # Support both hidden_size (Qwen/SDAR) and d_model (Llada)
-        hidden_size = getattr(hf_config, 'hidden_size', None) or getattr(hf_config, 'd_model', None)
-        # Support both num_attention_heads and n_heads
-        num_attention_heads = getattr(hf_config, 'num_attention_heads', None) or getattr(hf_config, 'n_heads', None)
-        head_dim = getattr(hf_config, "head_dim", hidden_size // num_attention_heads)
-        # Support both num_hidden_layers and n_layers
-        num_hidden_layers = getattr(hf_config, 'num_hidden_layers', None) or getattr(hf_config, 'n_layers', None)
-        # Get dtype with fallback
-        dtype_obj = getattr(hf_config, 'dtype', None) or torch.float16
-        if isinstance(dtype_obj, str):
-            dtype_obj = getattr(torch, dtype_obj.replace("torch.", ""))
-        block_bytes = 2 * num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype_obj.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        
+        # Reserve some buffer
+        available_mem = total * config.gpu_memory_utilization - used - peak + current
+        config.num_kvcache_blocks = int(available_mem) // block_bytes
+        
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(f"OOM: Not enough memory for KV cache. Block bytes: {block_bytes}, Avail: {available_mem}")
+
+        if self.rank == 0:
+            print(f"[KV Cache] Allocated {config.num_kvcache_blocks:,} blocks. Size: {config.num_kvcache_blocks * block_bytes / 1024**3:.2f} GB")
+
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -155,410 +191,429 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    # -------------------------------------------------------------------------
+    # Core Helpers
+    # -------------------------------------------------------------------------
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
+        if max_len == 0: return None
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
+    def prepare_sample(self, seqs: list[Sequence]):
+        temperatures = []
+        top_ps = []
+        for seq in seqs:
+            temperatures.append(seq.temperature)
+            top_ps.append(seq.top_p)
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return temperatures, top_ps
+
+    # -------------------------------------------------------------------------
+    # AR Pipeline (Nanovllm Style)
+    # -------------------------------------------------------------------------
+
+    def prepare_prefill_ar(self, seqs: list[Sequence]):
+        input_ids, positions, slot_mapping = [], [], []
+        cu_seqlens_q, cu_seqlens_k = [0], [0]
+        max_seqlen_q, max_seqlen_k = 0, 0
         block_tables = None
+        
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
+            # Only process new tokens
+            new_part = seq[seq.num_cached_tokens:]
+            input_ids.extend(new_part)
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
+            
+            if not seq.block_table: continue
+            
+            # Map slots for the new part
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
+                is_last_block = (i == seq.num_blocks - 1)
+                end = start + (seq.last_block_num_tokens if is_last_block else self.block_size)
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+                
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
+
+        # To GPU
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        from nanovllm.utils.context import RunType
-        set_context(True, run_type=RunType.PREFILL, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, block_tables=block_tables)
+        
+        set_context(
+            run_type=RunType.PREFILL, # AR prefill is compatible with this enum
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping, block_tables=block_tables
+        )
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+    def prepare_decode_ar(self, seqs: list[Sequence]):
+        input_ids, positions, slot_mapping, context_lens = [], [], [], []
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        from nanovllm.utils.context import RunType
-        set_context(False, run_type=RunType.DENOISE, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        
+        set_context(
+            run_type=RunType.DENOISE, # AR Decode maps to DENOISE/DECODE context
+            slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables
+        )
         return input_ids, positions
 
-    def prepare_denoise(self, seqs: list[Sequence]):
-        """Prepare denoise block for LLADA/SDAR models.
+    # -------------------------------------------------------------------------
+    # Diffusion Pipeline (JetEngine Style)
+    # -------------------------------------------------------------------------
+
+    def prepare_prefill_diffusion(self, seqs: list[Sequence]):
+        # Diffusion prefill differs: it often processes chunk-aligned segments
+        # and has complex slot mapping due to potential block alignment issues
+        input_ids, positions, is_last_step = [], [], []
+        cu_seqlens_q = [0]
+        max_seqlen_q = 0
+        slot_mapping = []
         
-        Adapted from jetengine/engine/model_runner.py:293
-        
-        In denoise phase:
-        - Query: intermediate_block_tokens (B*L tokens with mask tokens)
-        - Context: confirmed tokens (first len(seq) tokens)
-        - All denoise query positions attend to all confirmed context tokens
-        
-        Returns:
-        - input_ids: Flattened (B*L,) tensor
-        - positions: Flattened (B*L,) tensor with positions relative to confirmed context
-        """
-        from nanovllm.utils.context import RunType
-        
+        for seq in seqs:
+            seqlen = len(seq.token_ids) # Use full token_ids (prefill part)
+            input_ids.extend(seq.token_ids)
+            positions.extend(range(seqlen))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen)
+            max_seqlen_q = max(max_seqlen_q, seqlen)
+            is_last_step.append(False)
+            
+            if not seq.block_table: continue
+            
+            # Map every token to a physical slot
+            for i in range(seqlen):
+                block_idx = i // self.block_size
+                block_offset = i % self.block_size
+                physical_block_id = seq.block_table[block_idx]
+                slot = physical_block_id * self.block_size + block_offset
+                slot_mapping.append(slot)
+                
+        device = torch.device("cuda")
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+        is_last_step_t = torch.tensor(is_last_step, dtype=torch.bool).to(device, non_blocking=True)
+
+        set_context(
+            run_type=RunType.PREFILL,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_q,
+            slot_mapping=slot_mapping, 
+            is_last_denoise_step=is_last_step_t,
+            block_length=getattr(self.config, 'block_length', 128)
+        )
+        return input_ids, positions
+
+    def prepare_denoise_diffusion(self, seqs: list[Sequence]):
         block_len = len(seqs[0].intermediate_block_tokens)
         device = torch.device("cuda")
         
-        # Prepare context_lens: number of confirmed tokens per sequence
-        cached_lens_cpu = torch.tensor(
-            [len(seq) for seq in seqs], 
-            dtype=torch.int32, 
-            pin_memory=True
-        )
-        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
+        cached_lens = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
         
-        # Prepare input_ids: flatten all intermediate_block_tokens to (B*L,)
         input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
-        input_ids_cpu = torch.tensor(
-            input_ids_list, 
-            dtype=torch.int64, 
-            pin_memory=True
-        ).view(-1)  # Flatten to (B*L,)
-        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
+        input_ids = torch.tensor(input_ids_list, dtype=torch.int64, pin_memory=True).view(-1).to(device, non_blocking=True)
         
-        # Prepare positions: start from cached_lens, add offsets [0, 1, ..., block_len-1]
-        start_positions = cached_lens.unsqueeze(1)  # (B, 1)
-        offsets = torch.arange(block_len, dtype=torch.int64, device=device).unsqueeze(0)  # (1, L)
-        positions = (start_positions + offsets).view(-1)  # Flatten to (B*L,)
+        # Calculate global positions: start of cache + offset in block
+        start_positions = cached_lens.unsqueeze(1)
+        offsets = torch.arange(block_len, dtype=torch.int64, device=device).unsqueeze(0)
+        positions = (start_positions + offsets).view(-1)
         
-        # Prepare block_tables for context attention
         block_tables = self.prepare_block_tables(seqs)
-        
-        # Set context for denoise phase
+
         set_context(
-            False,
             run_type=RunType.DENOISE,
             context_lens=cached_lens,
             block_tables=block_tables,
-            block_length=seqs[0].block_length if seqs else 4
+            block_length=getattr(self.config, 'block_length', 128)
         )
-        
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence], run_type=None):
-        """Prepare sampling parameters.
-        
-        In PREFILL/DECODE: one parameter per sequence (N seqs)
-        In DENOISE:采样在 scheduler.postprocess 中直接处理 logits (B*L, V)
-                   不在这里处理参数
-        """
-        from nanovllm.utils.context import RunType
-        
-        if run_type is None:
-            run_type = RunType.PREFILL
-        
-        # For DENOISE, sampling is handled in scheduler.postprocess, not here
-        if run_type == RunType.DENOISE:
-            return None, None
-        
-        temperatures = []
-        top_ps = []
-        
-        for seq in seqs:
-            temperatures.append(seq.temperature)
-            top_ps.append(seq.top_p)
-        
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures, top_ps
+    # -------------------------------------------------------------------------
+    # Execution
+    # -------------------------------------------------------------------------
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        """Run model inference.
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, 
+                  run_type: RunType, mode: RunMode, batch_size: int = 0):
         
-        Adapted from jetengine/engine/model_runner.py:363
-        
-        DENOISE: Always use eager (no cuda graph), no slot_mapping
-        PREFILL/DECODE: Use cuda graph with slot_mapping if available
-        """
-        from nanovllm.utils.context import RunType
-        
-        context = get_context()
-        
-        # DENOISE: always eager (flash_attn_with_kvcache handles KV internally)
-        # Other modes: eager if enforce_eager or batch too large
-        if context.run_type == RunType.DENOISE or self.enforce_eager or input_ids.size(0) > 512:
+        # Case 1: Prefill (Generic) or Eager Mode -> Direct Forward
+        if run_type == RunType.PREFILL or self.enforce_eager:
             return self.model.compute_logits(self.model(input_ids, positions))
         
-        # PREFILL/DECODE: use cuda graph if available
-        bs = input_ids.size(0)
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-        graph_vars = self.graph_vars
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
+        # Case 2: CUDA Graph Execution
+        # We need to distinct between AR Graph (BS) and Diffusion Graph (BS * L)
         
-        # CRITICAL: Only fill slot_mapping in PREFILL, never in DENOISE
-        # DENOISE uses context_lens + block_tables (no slot_mapping)
-        if context.slot_mapping is not None:
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        context = get_context()
+        graph = None
         
-        if context.context_lens is not None:
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-        
-        if context.block_tables is not None:
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-        
-        graph.replay()
-        return self.model.compute_logits(graph_vars["outputs"][:bs])
+        if mode == RunMode.AR:
+            # Simple AR Decode Graph
+            if input_ids.size(0) > 512: # Threshold from original code
+                 return self.model.compute_logits(self.model(input_ids, positions))
+            
+            bs = input_ids.size(0)
+            target_graph_bs = next((x for x in self.graph_bs_ar if x >= bs), None)
+            if target_graph_bs:
+                graph = self.graphs_ar[target_graph_bs]
+                graph_vars = self.graph_vars_ar
+                
+                # Copy inputs
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+                
+                graph.replay()
+                return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, run_type=None) -> list[int] | torch.Tensor:
-        """Run model inference for a batch of sequences.
+        elif mode == RunMode.DIFFUSION:
+            # Diffusion Denoise Graph
+            # Batch size passed in is number of sequences, but input_ids is (B * L)
+            if batch_size == 0: batch_size = len(input_ids) // getattr(self.config, 'block_length', 1)
+            
+            target_graph_bs = next((x for x in self.graph_bs_diff if x >= batch_size), None)
+            
+            # Check conditions for graph validity
+            if target_graph_bs:
+                graph = self.graphs_diff.get(target_graph_bs)
+                graph_vars = self.graph_vars_diff
+                block_len = self.config.block_length
+                global_bs = batch_size * block_len
+                
+                # Check limits
+                if global_bs <= graph_vars["input_ids"].shape[0] and context.context_lens is not None:
+                     graph_vars["input_ids"][:global_bs].copy_(input_ids)
+                     graph_vars["positions"][:global_bs].copy_(positions)
+                     graph_vars["context_lens"][:batch_size].copy_(context.context_lens)
+                     
+                     graph_vars["block_tables"][:batch_size].fill_(-1)
+                     required_blocks = context.block_tables.shape[1]
+                     if required_blocks <= graph_vars["block_tables"].shape[1]:
+                         graph_vars["block_tables"][:batch_size, :required_blocks].copy_(context.block_tables)
+                         
+                         graph.replay()
+                         return self.model.compute_logits(graph_vars["outputs"][:global_bs])
+
+        # Fallback to eager if graph conditions not met
+        return self.model.compute_logits(self.model(input_ids, positions))
+
+    def run(self, seqs: list[Sequence], run_type: RunType) -> Union[list[int], torch.Tensor, None]:
+        if not seqs: return None
         
-        Adapted from jetengine/engine/model_runner.py:403
+        # Assume homogeneous batch
+        mode = seqs[0].mode
         
-        For PREFILL: returns sampled token_ids (list[int])
-        For DENOISE: returns raw logits tensor (B*L, vocab_size) for scheduler to handle
-        For DECODE: returns sampled token_ids (list[int]) - standard autoregressive
-        """
-        from nanovllm.utils.context import RunType
-        
-        if run_type is None:
-            # Backward compatibility: infer from is_prefill and sequence state
-            if is_prefill:
-                run_type = RunType.PREFILL
-            elif seqs and seqs[0].status == SequenceStatus.DENOISING:
-                run_type = RunType.DENOISE
-            else:
-                run_type = RunType.PREFILL  # Standard DECODE uses PREFILL for sampling
-        
-        try:
+        # 1. Prepare Inputs
+        if mode == RunMode.AR:
             if run_type == RunType.PREFILL:
-                # PREFILL: Use slot_mapping-based KV cache, sample tokens
-                input_ids, positions = self.prepare_prefill(seqs)
-                logits = self.run_model(input_ids, positions, is_prefill=True)
-                temperatures, top_ps = self.prepare_sample(seqs, run_type) if self.rank == 0 else (None, None)
-                token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
-                return token_ids
-            
-            elif run_type == RunType.DENOISE:
-                # DENOISE: return raw logits (B*L, V) for scheduler._postprocess_denoise
-                # DO NOT sample here - sampling happens in scheduler with advanced strategies
-                input_ids, positions = self.prepare_denoise(seqs)
-                logits = self.run_model(input_ids, positions, is_prefill=False)
-                return logits
-            
+                input_ids, positions = self.prepare_prefill_ar(seqs)
             else:
-                # Standard DECODE phase (autoregressive, e.g., Qwen3)
-                input_ids, positions = self.prepare_decode(seqs)
-                logits = self.run_model(input_ids, positions, is_prefill=False)
-                temperatures, top_ps = self.prepare_sample(seqs, RunType.PREFILL) if self.rank == 0 else (None, None)
-                token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
+                input_ids, positions = self.prepare_decode_ar(seqs)
+        else: # Diffusion
+            if run_type == RunType.PREFILL:
+                input_ids, positions = self.prepare_prefill_diffusion(seqs)
+            else:
+                input_ids, positions = self.prepare_denoise_diffusion(seqs)
+
+        # 2. Run Model (Compute Logits)
+        logits = self.run_model(input_ids, positions, run_type, mode, batch_size=len(seqs))
+
+        # 3. Post-Process / Sampling
+        # AR: Sample token IDs here to avoid sending logits
+        if mode == RunMode.AR:
+            if self.rank == 0:
+                temperatures, top_ps = self.prepare_sample(seqs)
+                token_ids = self.sampler(logits, temperatures, top_ps).tolist()
+                reset_context()
                 return token_ids
-        finally:
+            else:
+                reset_context()
+                return None
+        
+        # Diffusion: Return logits to scheduler for complex remasking
+        else:
             reset_context()
+            return logits if self.rank == 0 else None
+
+    # -------------------------------------------------------------------------
+    # Parameter Sync (AR Speculative Feature)
+    # -------------------------------------------------------------------------
 
     def update_model_param_with_broadcast(self, param_dict: dict[str, torch.Tensor]):
-        """Update model parameters by broadcasting full weights via NCCL.
-        
-        Rank 0 sends full (unsharded) weights to all ranks via NCCL broadcast.
-        Each rank then applies its own weight_loader to handle tensor parallel sharding.
-        
-        Args:
-            param_dict: A dictionary mapping parameter names to new tensor values.
-                       These should be FULL (unsharded) weights from the source model.
-        """
         if self.world_size == 1:
-            # Single GPU: use weight_loader directly
             self._apply_weights_with_loader(param_dict)
             return
-        
-        # Multi-GPU: store param_dict for rank 0 to use during broadcast
         self._pending_param_dict = param_dict
-        
-        # Signal other ranks to start receiving (send param info via shared memory)
         param_names = list(param_dict.keys())
         shapes = [list(t.shape) for t in param_dict.values()]
         dtypes = [str(t.dtype) for t in param_dict.values()]
-        
-        # call() will trigger _receive_and_apply_weights on all ranks including rank 0
         self.call("_receive_and_apply_weights", param_names, shapes, dtypes)
 
-    def _receive_and_apply_weights(self, param_names: list[str], shapes: list[list[int]], dtypes: list[str]):
-        """Receive weights via NCCL broadcast and apply with weight_loader.
-        
-        Called on all ranks. Rank 0 broadcasts, other ranks receive.
-        """
-        # Get param_dict from pending storage (only rank 0 has it)
+    def _receive_and_apply_weights(self, param_names, shapes, dtypes):
         param_dict = getattr(self, '_pending_param_dict', None)
-        
         packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
         
         for i, weight_name in enumerate(param_names):
             shape = torch.Size(shapes[i])
             dtype = getattr(torch, dtypes[i].replace('torch.', ''))
             
-            # Create buffer for receiving
-            if self.rank == 0 and param_dict is not None:
-                # Rank 0: use the actual tensor
+            if self.rank == 0 and param_dict:
                 full_weight = param_dict[weight_name].to(device='cuda', dtype=dtype)
             else:
-                # Other ranks: create empty buffer to receive
                 full_weight = torch.empty(shape, dtype=dtype, device='cuda')
             
-            # Broadcast from rank 0
             dist.broadcast(full_weight, src=0)
-            
-            # Now apply with weight_loader (each rank shards differently based on tp_rank)
             self._apply_single_weight(weight_name, full_weight, packed_modules_mapping)
-            
-            # Free memory
             del full_weight
-        
+            
         dist.barrier()
-        
-        # Clear pending param_dict
-        if hasattr(self, '_pending_param_dict'):
-            del self._pending_param_dict
+        if hasattr(self, '_pending_param_dict'): del self._pending_param_dict
 
-    def _apply_weights_with_loader(self, param_dict: dict[str, torch.Tensor]):
-        """Apply weights using weight_loader (single GPU path)."""
+    def _apply_weights_with_loader(self, param_dict):
         packed_modules_mapping = getattr(self.model, "packed_modules_mapping", {})
-        for weight_name, tensor in param_dict.items():
-            self._apply_single_weight(weight_name, tensor, packed_modules_mapping)
+        for name, tensor in param_dict.items():
+            self._apply_single_weight(name, tensor, packed_modules_mapping)
 
-    def _apply_single_weight(self, weight_name: str, tensor: torch.Tensor, packed_modules_mapping: dict):
-        """Apply a single weight using the appropriate weight_loader."""
-        # Check if this weight is part of a packed module (e.g., q_proj -> qkv_proj)
+    def _apply_single_weight(self, weight_name, tensor, packed_modules_mapping):
+        # Implementation of weight loader application
         for k, (v, shard_id) in packed_modules_mapping.items():
             if k in weight_name:
                 param_name = weight_name.replace(k, v)
                 try:
                     param = self.model.get_parameter(param_name)
-                    weight_loader = getattr(param, "weight_loader", None)
-                    if weight_loader is not None:
-                        with torch.no_grad():
-                            weight_loader(param, tensor, shard_id)
-                except AttributeError:
-                    pass
+                    if hasattr(param, "weight_loader"):
+                        with torch.no_grad(): param.weight_loader(param, tensor, shard_id)
+                except AttributeError: pass
                 break
         else:
-            # Not a packed module, load directly with weight_loader
             try:
                 param = self.model.get_parameter(weight_name)
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    with torch.no_grad():
-                        weight_loader(param, tensor)
+                if hasattr(param, "weight_loader"):
+                    with torch.no_grad(): param.weight_loader(param, tensor)
                 else:
-                    # Fallback: direct copy (for non-sharded params like layernorm)
-                    with torch.no_grad():
-                        param.data.copy_(tensor.to(param.device, param.dtype))
-            except AttributeError:
-                pass
+                    with torch.no_grad(): param.data.copy_(tensor.to(param.device, param.dtype))
+            except AttributeError: pass
 
-    def sync_model_param(self, param_names: list[str]):
-        """Sync model parameters across all ranks using NCCL broadcast.
-        
-        DEPRECATED: Use update_model_param_with_broadcast instead.
-        This method is kept for backwards compatibility but won't work correctly
-        for tensor parallel models where each rank needs different shards.
-        """
-        if self.world_size == 1:
-            return
-        
-        model_state = self.model.state_dict()
-        for name in param_names:
-            if name in model_state:
-                param = self._get_param_by_name(name)
-                if param is not None:
-                    dist.broadcast(param.data, src=0)
-        
-        dist.barrier()
-    
-    def _get_param_by_name(self, name: str) -> torch.nn.Parameter | None:
-        """Get a parameter by its state_dict key name."""
-        parts = name.split('.')
-        module = self.model
-        for part in parts[:-1]:
-            if hasattr(module, part):
-                module = getattr(module, part)
-            elif part.isdigit():
-                module = module[int(part)]
-            else:
-                return None
-        param_name = parts[-1]
-        if hasattr(module, param_name):
-            attr = getattr(module, param_name)
-            if isinstance(attr, torch.nn.Parameter):
-                return attr
-        return None
+    # -------------------------------------------------------------------------
+    # CUDA Graph Capture
+    # -------------------------------------------------------------------------
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # We need two separate capture routines or memory pools
+        # For simplicity, we capture both sets if capability allows, 
+        # or we could lazy-init. Here we capture both at startup.
+        
+        self.capture_cudagraph_ar()
+        
+        # Only capture Diffusion graphs if model supports it or config implies it
+        # Check if block_length is defined, implying diffusion potential
+        if hasattr(self.config, 'block_length') and self.config.block_length > 1:
+            self.capture_cudagraph_diffusion()
+
+    def capture_cudagraph_ar(self):
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        # Support both hidden_size (Qwen/SDAR) and d_model (Llada)
-        output_dim = getattr(hf_config, 'hidden_size', None) or getattr(hf_config, 'd_model', None)
-        outputs = torch.zeros(max_bs, output_dim)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.dtype)
+        
+        self.graph_bs_ar = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs_ar = {}
+        self.graph_pool_ar = None
 
-        for bs in reversed(self.graph_bs):
+        for bs in reversed(self.graph_bs_ar):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
+            # Context setup for capture
+            set_context(
+                run_type=RunType.DENOISE, # Maps to decode context logic in kernels
+                slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]
+            )
+            
+            # Warmup & Capture
+            self.model(input_ids[:bs], positions[:bs]) 
+            with torch.cuda.graph(graph, self.graph_pool_ar):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                
+            if self.graph_pool_ar is None: self.graph_pool_ar = graph.pool()
+            self.graphs_ar[bs] = graph
             reset_context()
 
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
+        self.graph_vars_ar = dict(
+            input_ids=input_ids, positions=positions, slot_mapping=slot_mapping,
+            context_lens=context_lens, block_tables=block_tables, outputs=outputs
+        )
+
+    def capture_cudagraph_diffusion(self):
+        config = self.config
+        block_len = config.block_length
+        max_bs = min(config.max_num_seqs, 256)
+        max_global_bs = max_bs * block_len
+        max_num_blocks = math.ceil((config.max_model_len + block_len) / self.block_size) + 1
+        
+        input_ids = torch.zeros(max_global_bs, dtype=torch.int64)
+        positions = torch.zeros(max_global_bs, dtype=torch.int64)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_global_bs, config.hidden_size, dtype=config.hf_config.dtype)
+        
+        self.graph_bs_diff = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs_diff = {}
+        self.graph_pool_diff = None
+
+        for bs in reversed(self.graph_bs_diff):
+            graph = torch.cuda.CUDAGraph()
+            # Diffusion Context
+            set_context(
+                run_type=RunType.DENOISE,
+                context_lens=context_lens[:bs], block_tables=block_tables[:bs], block_length=block_len
+            )
+            global_bs = bs * block_len
+            
+            self.model(input_ids[:global_bs], positions[:global_bs])
+            with torch.cuda.graph(graph, self.graph_pool_diff):
+                outputs[:global_bs] = self.model(input_ids[:global_bs], positions[:global_bs])
+            
+            if self.graph_pool_diff is None: self.graph_pool_diff = graph.pool()
+            self.graphs_diff[bs] = graph
+            reset_context()
+            
+        self.graph_vars_diff = dict(
+            input_ids=input_ids, positions=positions, context_lens=context_lens,
+            block_tables=block_tables, outputs=outputs
         )
