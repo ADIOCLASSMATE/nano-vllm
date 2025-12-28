@@ -19,14 +19,14 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    block_length: int | None = None
+    block_length: int = 4  # Default value matching jetengine
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill=False, run_type=None, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, block_length=None):
+def set_context(is_prefill=False, run_type=None, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, block_length=4):
     global _CONTEXT
     if run_type is None:
         # Backward compatibility: infer run_type from is_prefill if not provided

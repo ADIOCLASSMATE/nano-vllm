@@ -264,8 +264,9 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         
         # Set context for denoise phase
+        from nanovllm.utils.context import set_context
         set_context(
-            False,
+            is_prefill=False,
             run_type=RunType.DENOISE,
             context_lens=cached_lens,
             block_tables=block_tables,

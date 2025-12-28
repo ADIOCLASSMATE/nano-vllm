@@ -137,6 +137,7 @@ class Scheduler:
         - random: Random selection of mask tokens
         """
         import torch.nn.functional as F
+        from nanovllm.utils.sampling import top_k_top_p_sampling_from_probs
         
         batch_size = len(seqs)
         block_len = seqs[0].block_length if seqs else 4
@@ -146,23 +147,42 @@ class Scheduler:
         # Reshape logits: (B*L, V) -> (B, L, V)
         logits_reshaped = logits.view(batch_size, block_len, -1)
         
-        # Apply temperature and softmax to get probabilities
-        temperatures = torch.tensor(
-            [seq.temperature for seq in seqs], 
-            device=device, 
-            dtype=torch.float32
-        ).view(batch_size, 1, 1)
+        # Apply temperature and softmax to get probabilities (matching jetengine)
+        # Use consistent sampling params if all sequences have same params
+        consistent_sampling_params = all(
+            seq.temperature == seqs[0].temperature and
+            seq.top_k == seqs[0].top_k and
+            seq.top_p_param == seqs[0].top_p_param
+            for seq in seqs
+        )
         
-        logits_scaled = logits_reshaped / temperatures
-        probs = F.softmax(logits_scaled, dim=-1)  # (B, L, V)
+        if consistent_sampling_params:
+            # Single temperature for all
+            probs = F.softmax(logits_reshaped / seqs[0].temperature, dim=-1)
+            batch_top_k = seqs[0].top_k
+            batch_top_p = seqs[0].top_p_param
+        else:
+            # Per-sequence temperatures
+            temperatures = torch.tensor(
+                [seq.temperature for seq in seqs], 
+                device=device, 
+                dtype=torch.float32
+            ).view(batch_size, 1, 1)
+            logits_scaled = logits_reshaped / temperatures
+            probs = F.softmax(logits_scaled, dim=-1)
+            batch_top_k = torch.tensor([seq.top_k for seq in seqs], device=device, dtype=torch.long)
+            batch_top_p = torch.tensor([seq.top_p_param for seq in seqs], device=device, dtype=torch.float32)
         
         # Calculate entropies: (B, L)
         entropies_all = -(probs.clamp_min(EPS) * (probs.clamp_min(EPS)).log()).sum(dim=-1)
         
-        # Sample tokens from probabilities: (B, L)
-        probs_flat = probs.view(-1, probs.shape[-1])  # (B*L, V)
-        sampled_flat = torch.multinomial(probs_flat, num_samples=1).view(batch_size, block_len)
-        batch_seq_x0 = sampled_flat.to(torch.int64)
+        # Sample tokens from probabilities using top_k_top_p (matching jetengine)
+        # Shape: (B, L)
+        batch_seq_x0 = top_k_top_p_sampling_from_probs(
+            probs.view(-1, probs.shape[-1]),  # (B*L, V)
+            top_k=batch_top_k,
+            top_p=batch_top_p
+        ).to(torch.int64).view(batch_size, block_len)
         
         # Get probabilities and log-probabilities of sampled tokens: (B, L)
         batch_seq_x0_p = torch.gather(probs, -1, batch_seq_x0.unsqueeze(-1)).squeeze(-1)
@@ -298,6 +318,13 @@ class Scheduler:
                 
                 fallback_indices = (range_tensor >= start_pos_b) & (range_tensor < end_pos_b) & fallback_mask_token_mask
                 dyn_transfer_index[needs_fallback] = fallback_indices
+            
+            # Update the batch_num_to_transfer tensor for sequences that used this strategy
+            batch_num_to_transfer = torch.where(
+                low_conf_dynamic_mask.squeeze(1),
+                dyn_transfer_index.sum(dim=1),
+                batch_num_to_transfer
+            )
             
             transfer_index = torch.where(low_conf_dynamic_mask, dyn_transfer_index, transfer_index)
         
