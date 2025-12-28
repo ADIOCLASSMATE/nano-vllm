@@ -13,7 +13,7 @@ def main():
         mask_token_id=126336, 
         block_length=1024, 
         max_num_seqs=32,
-        gpu_memory_utilization=0.9
+        gpu_memory_utilization=0.8
         )
     sampling_params = SamplingParams(
         temperature=1.0, 
@@ -47,7 +47,7 @@ def main():
     print(f"Total requests: {len(prompts_list)}")
     
     outputs = llm.generate_streaming(
-        prompts_list, sampling_params, max_active=512)
+        prompts_list, sampling_params, max_active=32)
 
     for output in outputs:
         print("\n")
