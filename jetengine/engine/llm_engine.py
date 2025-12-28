@@ -414,8 +414,9 @@ class LLMEngine:
                 outputs[seq_id] = {
                     "token_ids": token_ids, 
                     "trajectory": trajectory,
-                    "logprobs": logprobs,  # NEW
-                    "entropies": entropies  # NEW
+                    "logprobs": logprobs,
+                    "entropies": entropies,
+                    "Throughput": throughput,
                 }
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
@@ -437,7 +438,8 @@ class LLMEngine:
                 "token_ids": token_ids, 
                 "trajectory": trajectory,
                 "logprobs": logprobs,  # NEW
-                "entropies": entropies  # NEW
+                "entropies": entropies,
+                "Throughput": throughput,
             })
 
         if use_tqdm:

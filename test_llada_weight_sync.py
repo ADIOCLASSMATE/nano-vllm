@@ -40,7 +40,7 @@ def main():
     # List of SDAR models to sync sequentially
     # You can add multiple SDAR model paths here
     target_models = [
-        "./public/models/SDAR/SDAR-8B-Chat",
+        "./public/models/LLaDA/LLaDA-8B-Instruct",
     ]
     
     # SDAR-specific test prompts
@@ -51,7 +51,7 @@ def main():
     ]
     
     # SDAR-specific sampling parameters (matching example_sdar.py)
-    sdar_block_size = 4
+    llada_block_size = 4
     sampling_params = SamplingParams(
         temperature=1.0,
         topk=0,
@@ -59,12 +59,22 @@ def main():
         max_tokens=512,  # Reduced for testing
         remasking_strategy="low_confidence_dynamic",
         dynamic_threshold=0.9,
-        block_length=sdar_block_size,
-        denoising_steps=sdar_block_size
+        block_length=llada_block_size,
+        denoising_steps=llada_block_size
     )
 
     console.print(Panel.fit("[bold blue]SDAR Model Weight Synchronization Test[/bold blue]", border_style="blue"))
 
+    # Note: jetengine uses accelerate.PartialState which can work in two modes:
+    # 1. Single GPU (tensor_parallel_size=1): Can run directly with `python script.py`
+    #    PartialState() will detect no distributed env and create a single-process "pseudo-distributed" environment
+    # 2. Multi-GPU (tensor_parallel_size>1): Must use `accelerate launch script.py`
+    #    to properly initialize multiple processes
+    tensor_parallel_size = 1  # Change to >1 for multi-GPU, then use: accelerate launch test_sdar_weight_sync.py
+    
+    if tensor_parallel_size > 1:
+        console.print("[bold yellow]⚠[/bold yellow] Multi-GPU mode detected. Make sure to run with: [cyan]accelerate launch test_sdar_weight_sync.py[/cyan]")
+    
     # --- Step 1: Initialize jetengine with the first SDAR model ---
     initial_model_path = target_models[0]
     with console.status(f"[bold cyan]Initializing jetengine with {os.path.basename(initial_model_path)}...") as status:
@@ -72,9 +82,9 @@ def main():
         llm = LLM(
             initial_model_path,
             enforce_eager=False,
-            tensor_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
             mask_token_id=151669,  # SDAR-specific mask token ID
-            block_length=sdar_block_size,
+            block_length=llada_block_size,
             max_num_seqs=32,  # Reduced for testing
             max_model_len=2048,  # Reduced for testing
             gpu_memory_utilization=0.8
